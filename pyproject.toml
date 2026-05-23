@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "Independent reproduction of declare-lab/delta-Mem on RTX 3060 / Windows 11"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch",
+    "torch==2.5.1",
     "transformers",
     "datasets",
     "accelerate",
@@ -26,3 +26,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["run"]
+
+# Route torch through the PyTorch cu121 index so `uv run` / `uv sync` always
+# selects the CUDA-enabled wheel, not PyPI's CPU build. The 3060 (Ampere, sm_86)
+# is fully supported by the cu121 wheels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
