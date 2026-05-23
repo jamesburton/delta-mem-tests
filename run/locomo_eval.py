@@ -1,33 +1,34 @@
-"""Run the vendored delta-Mem LoCoMo eval verbatim, then emit the reproduction
-report via run.report_gen.
+"""Run the vendored delta-Mem LoCoMo eval via a small monkeypatching driver,
+then emit the reproduction report via run.report_gen.
 
-This wrapper deliberately does NOT reimplement scoring — it invokes the vendored
-eval module/script as-is and reads the scores it produces. Methodology fidelity
-is the whole point of Tier 1 (spec risk R3).
+This wrapper deliberately does NOT reimplement scoring. Methodology fidelity
+is the whole point of Tier 1 (spec risk R3). The single controller-approved
+deviation is a chunked-prefill monkeypatch (see run/_chunked_eval_runner.py)
+that fits the eval inside 12 GB VRAM on the RTX 3060 without changing any
+numerics — autoregressive attention is unaffected by how the prefill is
+batched. The patch is documented in the reproduction report itself.
 
-Entry point discovered in Subtask A: ``deltamem.eval.locomo_delta`` has an
-``if __name__ == "__main__": main()`` block (locomo_delta.py:1074-1075).
-Invoked as ``python -m deltamem.eval.locomo_delta``.
+Entry point: invoked via ``python -m run._chunked_eval_runner`` which
+monkeypatches build_teacher_forced_snapshot before calling the vendored
+eval's main(). The vendored submodule is NOT modified on disk; the pinned
+commit hash still holds.
 
 Output JSON schema (nested, not flat):
 - frozen backbone score: data["base"]["summary"]["full_history_replay"]["overall_score"]
 - delta-mem score:       data["delta"]["summary"]["full_history_replay"]["overall_score"]
-No "skipped_samples" key exists in the eval output — the eval either completes
-or errors; skipped_samples is passed as [] to render_report.
+No "skipped_samples" key exists in the eval output; passed as [] to render_report.
 
 max_seq_len is NOT a CLI flag. The eval calls infer_model_context_window() at
 runtime which reads model.config.max_position_embeddings (262144 for
 Qwen3-4B-Instruct-2507). Recorded in EVAL_CONFIG for the report.
 
-Sample limit: --max-conversations N is supported (locomo_delta.py:216-217).
-Subtask C verification: wiring test (tests/test_locomo_eval_wiring.py) — a
-small-slice dry-run requires GPU + model load so we verify _extract_ratios and
-_read_vendored_commit with a synthetic fake-scores JSON instead.
+Sample limit: --max-conversations N is supported.
 
 Outputs:
     - report/raw/locomo-stdout.log   (full stdout/stderr of the eval)
     - report/raw/locomo-scores.json  (the eval's own scores file, copied here)
-    - report/reproduction-report.md  (via run.report_gen)
+    - report/reproduction-report.md  (via run.report_gen, with a prepended
+                                       Methodology adjustments section)
 """
 
 from __future__ import annotations
@@ -71,6 +72,11 @@ EVAL_CONFIG = {
     "attn_implementation": "sdpa",
     "max_seq_len": _QWEN3_4B_MAX_POSITION_EMBEDDINGS,
     "scan_impl": "torch",  # see report/kernels-gate.md
+    "methodology_adjustment": (
+        "build_teacher_forced_snapshot chunked via run/_chunked_eval_runner.py "
+        "(per-message ingestion; mathematically equivalent to vendored version "
+        "but bounded VRAM)"
+    ),
 }
 PAPER_RATIO = 1.20
 TOLERANCE = 0.05
@@ -113,7 +119,7 @@ def _invoke_vendored_eval(
                              partial runs / dry-run verification
     """
     cmd = [
-        sys.executable, "-m", "deltamem.eval.locomo_delta",
+        sys.executable, "-m", "run._chunked_eval_runner",
         "--model-path", model_path,
         "--adapter-dir", adapter_path,
         "--dtype", EVAL_CONFIG["dtype"],
@@ -245,6 +251,38 @@ def main() -> int:
         vendored_commit=_read_vendored_commit(),
         eval_config=EVAL_CONFIG,
     )
+
+    # Prepend a Methodology adjustments section so future readers immediately
+    # see the controller-approved chunked-prefill patch (the only deviation
+    # from a bit-for-bit-faithful reproduction).
+    METHODOLOGY_NOTE = (
+        "\n## Methodology adjustments\n"
+        "\n"
+        "One controller-approved deviation from the vendored eval, documented in full:\n"
+        "\n"
+        "- **Chunked prefill** via `run/_chunked_eval_runner.py`. The vendored "
+        "`build_teacher_forced_snapshot` (`delta-Mem/deltamem/eval/locomo_delta.py:160-171`) "
+        "does a single `_ingest_full_ids(full_history)` on the entire ~26k-token "
+        "conversation, which OOMs on a 12 GB GPU at the SDPA prefill step. We "
+        "replace it with a per-message loop that calls `_ingest_full_ids` once per "
+        "message, relying on the session's built-in prefix-skip "
+        "(`delta-Mem/deltamem/runtime/session.py:515-545`) to process only the new "
+        "suffix each call.\n"
+        "\n"
+        "  This is mathematically equivalent: autoregressive attention depends only "
+        "on prior tokens via the KV cache, so chunking the prefill yields the same "
+        "per-token logits as the monolithic version. The vendored submodule is NOT "
+        "modified on disk; the patch is applied in-process via monkeypatch.\n"
+        "\n"
+        "  See the \"Eval config\" section below for the same fact recorded in the "
+        "config dict (`methodology_adjustment` key).\n"
+    )
+    # Insert the section after the title line and before the Verdict line.
+    md_lines = md.splitlines()
+    # md_lines[0] is the title; insert after the title's blank line (line 1).
+    md_lines.insert(2, METHODOLOGY_NOTE.rstrip())
+    md = "\n".join(md_lines) + ("\n" if not md.endswith("\n") else "")
+
     REPORT_PATH.write_text(md, encoding="utf-8")
 
     print(f"Wrote {REPORT_PATH}")
