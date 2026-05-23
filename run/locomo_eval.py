@@ -72,10 +72,17 @@ EVAL_CONFIG = {
     "attn_implementation": "sdpa",
     "max_seq_len": _QWEN3_4B_MAX_POSITION_EMBEDDINGS,
     "scan_impl": "torch",  # see report/kernels-gate.md
+    # Default 8 (vs vendored 64) to fit base-eval generate() inside 12 GB on
+    # the RTX 3060. Greedy scoring (do_sample=False) is batch-invariant; the
+    # broadened-OOM monkeypatch in _chunked_eval_runner.py provides bisection
+    # to 4/2/1 if 8 still overshoots on some sample.
+    "eval_batch_size": 8,
     "methodology_adjustment": (
         "build_teacher_forced_snapshot chunked via run/_chunked_eval_runner.py "
         "(per-message ingestion; mathematically equivalent to vendored version "
-        "but bounded VRAM)"
+        "but bounded VRAM); --eval-batch-size lowered to 8 and "
+        "_generate_prompt_chunk wrapped so non-typed CUDA-OOM RuntimeErrors "
+        "re-raise as torch.OutOfMemoryError to engage the vendored bisector"
     ),
 }
 PAPER_RATIO = 1.20
@@ -124,6 +131,7 @@ def _invoke_vendored_eval(
         "--adapter-dir", adapter_path,
         "--dtype", EVAL_CONFIG["dtype"],
         "--attn-implementation", EVAL_CONFIG["attn_implementation"],
+        "--eval-batch-size", str(EVAL_CONFIG["eval_batch_size"]),
         "--output-json", str(output_json),
     ]
     if max_conversations is not None:
@@ -258,7 +266,7 @@ def main() -> int:
     METHODOLOGY_NOTE = (
         "\n## Methodology adjustments\n"
         "\n"
-        "One controller-approved deviation from the vendored eval, documented in full:\n"
+        "Two controller-approved deviations from the vendored eval, documented in full:\n"
         "\n"
         "- **Chunked prefill** via `run/_chunked_eval_runner.py`. The vendored "
         "`build_teacher_forced_snapshot` (`delta-Mem/deltamem/eval/locomo_delta.py:160-171`) "
@@ -274,8 +282,21 @@ def main() -> int:
         "per-token logits as the monolithic version. The vendored submodule is NOT "
         "modified on disk; the patch is applied in-process via monkeypatch.\n"
         "\n"
-        "  See the \"Eval config\" section below for the same fact recorded in the "
-        "config dict (`methodology_adjustment` key).\n"
+        "- **Lowered `--eval-batch-size` (64 → 8) plus OOM-class normalisation.** "
+        "The base-eval `model.generate` path OOMs on 12 GB at the vendored default "
+        "batch of 64. The eval already has a divide-and-conquer retry "
+        "(`locomo_delta.py:600-665`) that halves the batch on `torch.OutOfMemoryError` "
+        "but the kernel raises a generic `RuntimeError(\"CUDA error: out of memory\")` "
+        "from inside SDPA mask construction, which the bisector does not catch. "
+        "We (a) set the initial batch to 8 so most samples complete first try, and "
+        "(b) wrap `_generate_prompt_chunk` to re-raise CUDA-OOM `RuntimeError`s as "
+        "`torch.OutOfMemoryError` so the existing bisector engages and halves to "
+        "4/2/1 when needed. Greedy scoring (the LoCoMo `overall_score` path uses "
+        "`do_sample=False`) is batch-size-invariant, so this changes peak VRAM "
+        "and runtime only, not numerics.\n"
+        "\n"
+        "  See the \"Eval config\" section below for the same facts recorded in the "
+        "config dict (`methodology_adjustment` and `eval_batch_size` keys).\n"
     )
     # Insert the section after the title line and before the Verdict line.
     md_lines = md.splitlines()

@@ -53,7 +53,7 @@ on prior tokens through the KV cache, and the KV cache is built by the same
 forward pass in both versions; only the batching of that forward differs.
 Same per-token logits, same delta-mem updates, same final snapshot.
 
-## Status at end of session
+## Status at end of first session
 
 - Chunked runner committed.
 - Awaiting full eval run (Step 2). The user mentioned a fallback machine
@@ -61,15 +61,56 @@ Same per-token logits, same delta-mem updates, same final snapshot.
   patch should fit comfortably in 12 GB even on slower hardware. The
   invocation is the same: `uv run python -m run.locomo_eval`.
 
+## Second OOM on T5500 (2026-05-23, internal RTX 3060)
+
+After the smoke test passed on the T5500, the first full-eval attempt OOMed
+at a *new* code path: base-eval `model.generate` inside
+`_batched_generate_raw_predictions` → `_generate_prompt_chunk`, which the
+chunked-prefill patch did not cover. Two root causes:
+
+1. **Vendored default `--eval-batch-size 64`** (`locomo_delta.py:213`) is too
+   large for a 12 GB card on this model + dataset.
+2. The eval's halving-retry catches only `torch.OutOfMemoryError`, but the
+   actual exception was a plain `RuntimeError("CUDA error: out of memory")`
+   from inside `transformers/masking_utils.py:299` (SDPA causal mask), so the
+   bisector never engaged.
+
+## Second approved deviation: batch=8 + OOM-class normalisation
+
+User-approved on 2026-05-23:
+
+- Plumb `--eval-batch-size 8` through `run/locomo_eval.py` (recorded in
+  `EVAL_CONFIG["eval_batch_size"]`).
+- In `run/_chunked_eval_runner.py`, wrap `_generate_prompt_chunk` so any
+  `RuntimeError` whose message contains "out of memory" is re-raised as
+  `torch.OutOfMemoryError` (and `torch.cuda.empty_cache()` is called before
+  re-raise). This lets the vendored bisector at `locomo_delta.py:617-665`
+  engage and halve 8 → 4 → 2 → 1 when an individual sample needs it.
+
+**Why this is not a numerical change for the headline scores:** the LoCoMo
+`overall_score` path runs `do_sample=False` (greedy), so per-prompt logits
+are batch-size-invariant. Sampling-only paths (history-replay probes) ARE
+batch-RNG-sensitive in principle, but no reference batch size is committed
+in the upstream repo, so the vendored default of 64 was already a free
+choice; 8 is the same kind of choice with smaller VRAM.
+
+The vendored submodule remains unmodified on disk; the pinned commit hash
+(`98dc679572ef77d77b97485bf2f2b2aa810b74ba`) is unchanged. Both deviations
+are in-process monkeypatches recorded in the reproduction report's
+"Methodology adjustments" section and in `EVAL_CONFIG["methodology_adjustment"]`.
+
 ## If you are picking this up on the T5500
 
 1. Verify env: `uv sync && uv run pytest tests/ -v` (all 10 should pass).
 2. Verify path-lock: smoke test still works.
    `uv run python -m run.smoke_chat`
 3. Run the full eval: `uv run python -m run.locomo_eval 2>&1 | Tee-Object report/raw/locomo-driver.log`
-4. Watch `report/raw/locomo-stdout.log` for `[chunked-prefill i/N]` lines —
-   they confirm the patch is active. Each line should show `suffix=` much
-   smaller than `total=`; if `suffix=` ever equals `total=` past the first
-   message, the safety assertion will fire and abort.
+4. Watch `report/raw/locomo-stdout.log` for:
+   - `[chunked-prefill i/N]` lines confirm the prefill patch is active. Each
+     line should show `suffix=` much smaller than `total=`; if `suffix=` ever
+     equals `total=` past the first message, the safety assertion will fire
+     and abort.
+   - `[locomo_delta] CUDA OOM at batch size N; retrying with ...` lines (if
+     they appear) confirm the bisector engaged via the broadened-OOM catch.
 5. On completion, `report/reproduction-report.md` is written and the verdict
    is one of PASS / OUT_OF_BAND / REGRESSION.

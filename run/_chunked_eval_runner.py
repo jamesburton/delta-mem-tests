@@ -24,8 +24,10 @@ import os
 # Path-lock per report/kernels-gate.md (must come before any deltamem import)
 os.environ.setdefault("DELTA_MEM_SCAN_IMPL", "torch")
 
+import gc
 import sys
 
+import torch
 import deltamem.eval.locomo_delta as eval_mod
 from deltamem.core import reset_delta_mem_states
 from deltamem.runtime.session import DeltaMemChatSession
@@ -70,6 +72,41 @@ def _chunked_build_teacher_forced_snapshot(model, tokenizer, device, history):
 
 
 eval_mod.build_teacher_forced_snapshot = _chunked_build_teacher_forced_snapshot
+
+
+# --- Second controller-approved patch: broaden the OOM-bisection trigger. ---
+# The vendored _batched_generate_raw_predictions (locomo_delta.py:600-665) has
+# a divide-and-conquer retry that catches torch.OutOfMemoryError. On this host
+# the kernel raises a generic RuntimeError("CUDA error: out of memory") from
+# inside SDPA mask construction, which is NOT a subclass of OutOfMemoryError —
+# so the bisection never engages and the eval fails on the first oversized
+# batch. We wrap _generate_prompt_chunk so any RuntimeError whose message
+# mentions "out of memory" is re-raised as torch.OutOfMemoryError, letting the
+# existing bisector kick in unchanged.
+#
+# This is purely an error-class normalisation: the retry behaviour, the
+# halving, and the per-batch numerics are all the vendored code's.
+
+_orig_generate_prompt_chunk = eval_mod._generate_prompt_chunk
+
+
+def _oom_normalised_generate_prompt_chunk(*args, **kwargs):
+    try:
+        return _orig_generate_prompt_chunk(*args, **kwargs)
+    except torch.OutOfMemoryError:
+        raise
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "out of memory" in msg or "cuda error: out of memory" in msg:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise torch.OutOfMemoryError(str(exc)) from exc
+        raise
+
+
+eval_mod._generate_prompt_chunk = _oom_normalised_generate_prompt_chunk
+
 
 # Re-shape sys.argv so the eval's argparse sees the expected program name
 # rather than "run._chunked_eval_runner". Cosmetic but cleaner help output.
