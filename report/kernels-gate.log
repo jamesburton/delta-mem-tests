@@ -1,0 +1,6 @@
+=== Importing deltamem.kernels (triggers JIT build if needed) ===
+OK  import deltamem
+OK  import deltamem.core
+OK  import deltamem.kernels
+ALL_KERNELS_IMPORTED
+GATE: PASS
