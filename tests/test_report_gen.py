@@ -63,3 +63,24 @@ def test_render_report_marks_oob_clearly():
     assert "OUT_OF_BAND" in out
     # No silent papering-over: the deviation magnitude must be visible
     assert "0.10" in out  # 1.20 - 1.10
+
+
+def test_render_report_marks_regression_clearly():
+    out = render_report(
+        our_ratio=0.95,
+        paper_ratio=1.20,
+        tolerance=0.05,
+        our_delta_mem_score=0.50,
+        our_frozen_score=0.53,
+        peak_vram_gb=10.0,
+        skipped_samples=[],
+        vendored_commit="abc123",
+        eval_config={"model": "x", "adapter": "y", "dtype": "bfloat16",
+                     "attn_implementation": "sdpa", "max_seq_len": 8192},
+    )
+    # Symmetric with the OOB test: a REGRESSION must surface that delta-mem
+    # FAILED to improve over the frozen backbone, and the offending ratio
+    # must be visible — same "no silent papering-over" rule the spec mandates.
+    assert "REGRESSION" in out
+    assert "0.95" in out
+    assert "below 1.0" in out
