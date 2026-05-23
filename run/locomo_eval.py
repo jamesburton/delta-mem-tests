@@ -117,6 +117,7 @@ def _invoke_vendored_eval(
     adapter_path: str,
     output_json: Path,
     max_conversations: Optional[int] = None,
+    max_questions_per_conversation: Optional[int] = None,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -145,6 +146,8 @@ def _invoke_vendored_eval(
     ]
     if max_conversations is not None:
         cmd += ["--max-conversations", str(max_conversations)]
+    if max_questions_per_conversation is not None:
+        cmd += ["--max-questions-per-conversation", str(max_questions_per_conversation)]
 
     log_path = RAW_DIR / "locomo-stdout.log"
     print(f"Running: {' '.join(cmd)}")
@@ -227,6 +230,14 @@ def main() -> int:
         help="(Partial-run only) cap eval to N conversations via --max-conversations; "
              "omit for the real Task 7 full run.",
     )
+    parser.add_argument(
+        "--max-questions-per-conversation",
+        type=int,
+        default=None,
+        help="(Partial-run only) cap questions per conversation. Useful for "
+             "validating optimisation patches (e.g. KV-cache reuse) against a "
+             "small reference set before scaling up.",
+    )
     args = parser.parse_args()
 
     output_json = Path(args.output_json)
@@ -251,6 +262,7 @@ def main() -> int:
         adapter_path=adapter_path,
         output_json=output_json,
         max_conversations=args.max_conversations,
+        max_questions_per_conversation=args.max_questions_per_conversation,
     )
     dm, fz, skipped = _extract_ratios(scores_path)
 

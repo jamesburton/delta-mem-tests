@@ -94,6 +94,65 @@ the CUDA OOM recovery itself **crashed the Python process** with Windows
 `memory allocation of 2289664 bytes failed` from the C runtime. The bisector
 is not usable as a safety net on this host.
 
+## Fourth observation: per-question full-prefill is the actual bottleneck
+
+After batch=2 was running cleanly, the vendored eval's progress bar revealed
+a much worse problem: each question takes ~17–25 minutes because
+`model.generate` does a fresh ~17.6k-token prefill for every single question,
+with no KV-cache reuse across questions in the same conversation. ETA at
+batch=2 for the full 1,986-question set: ~25 days.
+
+The vendored eval's `_generate_prompt_chunk` builds prompts as
+`history_messages + [question]` and calls `model.generate(input_ids=..., past_key_values=None)`
+fresh per question. Power draw is 55 W (vs 170 W TDP) — kernel is
+memory-bandwidth-bound on the long-prefill SDPA path. Lowering batch
+doesn't help; raising batch OOMs.
+
+## Fifth approved deviation (planned): per-conversation KV-cache reuse via DeltaMemChatSession
+
+**Key insight:** `DeltaMemChatSession._ingest_full_ids`
+(`delta-Mem/deltamem/runtime/session.py:515-567`) already implements
+prefix-skip: it computes `_common_prefix_len`, slices off the new suffix,
+and runs the forward pass only on the suffix using
+`past_key_values=self.past_key_values`. This is the SAME mechanism our
+chunked-prefill patch already relies on for the snapshot build. It just
+isn't being used for per-question generation in the eval's `_generate_prompt_chunk`.
+
+**The catch:** after a question's generated tokens are appended to
+`session.processed_input_ids`, the next question (different from question 1)
+diverges from the cached prefix, and `_ingest_full_ids` hits the
+`rebuilt=True` fallback that throws away the cache and re-prefills from
+scratch.
+
+**Solution:** crop the KV cache back to history length after each question.
+`transformers.cache_utils.Cache.crop(max_length)` exists and truncates each
+layer's K/V tensors. So per conversation:
+1. Build session, chunked-ingest the history (same as snapshot patch).
+2. Save the post-history state: `history_len = past_kv.get_seq_length()`.
+3. For each question:
+   a. Ingest `history + question` — only the question suffix gets prefilled.
+   b. Iteratively generate tokens via `_decode_generate`.
+   c. Crop the KV cache back to `history_len`; reset
+      `processed_input_ids = history_ids`.
+4. After the conversation, free the session.
+
+**Expected speedup:** per-question prefill drops from ~17.6k tokens to
+~50–100 tokens (just the question text). Per-question time should fall
+from ~17 min to ~1 min — a 15–25× speedup.
+
+**Numerical equivalence:** greedy decoding gives bitwise-identical logits
+to fresh prefill (autoregressive attention only depends on prior tokens
+via the KV cache, which we reconstruct exactly). Sampling paths see the
+same RNG stream because the eval wraps generation in
+`torch.random.fork_rng + torch.manual_seed(batch_seed)` (`locomo_delta.py:572-574`)
+and our prefill is deterministic.
+
+**Validation:** before scaling, run the same `--max-conversations 1
+--max-questions-per-conversation 10` partial set with the patch enabled
+and diff per-question `raw_prediction` strings against the baseline. If
+they match (or differ only by sampling RNG that's already
+batch-size-sensitive), enable for the full run.
+
 ## Third approved deviation: hard-set --eval-batch-size 2
 
 User-approved on 2026-05-23: drop the initial batch to a size that NEVER OOMs
