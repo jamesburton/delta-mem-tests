@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.uv/
+*.egg-info/
+
+# Reports raw outputs (large) - keep dir, not contents
+report/raw/*
+!report/raw/.gitkeep
+
+# Editor
+.vscode/
+.idea/
+*.swp

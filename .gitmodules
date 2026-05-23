@@ -1,0 +1,3 @@
+[submodule "delta-Mem"]
+	path = delta-Mem
+	url = https://github.com/declare-lab/delta-Mem.git
