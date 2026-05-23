@@ -75,7 +75,7 @@ chunked-prefill patch did not cover. Two root causes:
    from inside `transformers/masking_utils.py:299` (SDPA causal mask), so the
    bisector never engaged.
 
-## Second approved deviation: batch=8 + OOM-class normalisation
+## Second approved deviation: batch=8 + OOM-class normalisation (failed; superseded)
 
 User-approved on 2026-05-23:
 
@@ -86,6 +86,27 @@ User-approved on 2026-05-23:
   `torch.OutOfMemoryError` (and `torch.cuda.empty_cache()` is called before
   re-raise). This lets the vendored bisector at `locomo_delta.py:617-665`
   engage and halve 8 → 4 → 2 → 1 when an individual sample needs it.
+
+**Outcome:** Chunked prefill ran fine (all 20 messages, peak ~17.6k tokens),
+the broadened-OOM catch engaged on the first base-eval batch (8 → 4+4), but
+the CUDA OOM recovery itself **crashed the Python process** with Windows
+`STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`) and a CPU-side
+`memory allocation of 2289664 bytes failed` from the C runtime. The bisector
+is not usable as a safety net on this host.
+
+## Third approved deviation: hard-set --eval-batch-size 2
+
+User-approved on 2026-05-23: drop the initial batch to a size that NEVER OOMs
+rather than relying on bisector recovery.
+
+- 8 GB weights + 2 × ~0.6 GB KV-cache + SDPA prefill scratch ≈ 9.5-10 GB on a
+  12 GB card — under budget with ~2 GB of headroom.
+- The OOM-class normalisation patch in `_chunked_eval_runner.py` stays in
+  place as a defence-in-depth wrapper. It should not fire at batch=2 on any
+  sample; if it does, that's a separate signal to investigate (likely an
+  individual conversation longer than 17.6k tokens).
+- `EVAL_CONFIG["eval_batch_size"]` updated to 2; methodology section in the
+  reproduction report records this change in full.
 
 **Why this is not a numerical change for the headline scores:** the LoCoMo
 `overall_score` path runs `do_sample=False` (greedy), so per-prompt logits

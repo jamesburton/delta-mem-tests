@@ -72,17 +72,26 @@ EVAL_CONFIG = {
     "attn_implementation": "sdpa",
     "max_seq_len": _QWEN3_4B_MAX_POSITION_EMBEDDINGS,
     "scan_impl": "torch",  # see report/kernels-gate.md
-    # Default 8 (vs vendored 64) to fit base-eval generate() inside 12 GB on
-    # the RTX 3060. Greedy scoring (do_sample=False) is batch-invariant; the
-    # broadened-OOM monkeypatch in _chunked_eval_runner.py provides bisection
-    # to 4/2/1 if 8 still overshoots on some sample.
-    "eval_batch_size": 8,
+    # Default 2 (vs vendored 64) to fit base-eval generate() inside 12 GB on
+    # the RTX 3060. Each base-eval prompt is history_messages + question
+    # (~17.6k + question tokens), so 8 GB weights + N x ~0.6 GB KV + SDPA
+    # scratch limits us to ~2 prompts in parallel on a 12 GB card. We attempted
+    # batch=8 with a broadened OOM-class normalisation to engage the vendored
+    # bisector (locomo_delta.py:600-665), but on this host the recovery from
+    # CUDA OOM corrupts the process (Windows STATUS_STACK_BUFFER_OVERRUN), so
+    # we must size the initial batch to NEVER OOM. The bisector and OOM-class
+    # normalisation remain in place as belt-and-braces but should not fire on
+    # the chosen size. Greedy scoring (do_sample=False) is batch-invariant.
+    "eval_batch_size": 2,
     "methodology_adjustment": (
         "build_teacher_forced_snapshot chunked via run/_chunked_eval_runner.py "
         "(per-message ingestion; mathematically equivalent to vendored version "
-        "but bounded VRAM); --eval-batch-size lowered to 8 and "
-        "_generate_prompt_chunk wrapped so non-typed CUDA-OOM RuntimeErrors "
-        "re-raise as torch.OutOfMemoryError to engage the vendored bisector"
+        "but bounded VRAM); --eval-batch-size lowered to 2 to fit 17.6k-token "
+        "prompts on 12 GB without triggering the vendored OOM bisector, which "
+        "crashed the process (STATUS_STACK_BUFFER_OVERRUN) on this host when "
+        "recovering from CUDA OOM; _generate_prompt_chunk also wrapped so "
+        "non-typed CUDA-OOM RuntimeErrors re-raise as torch.OutOfMemoryError "
+        "as a defence-in-depth safeguard"
     ),
 }
 PAPER_RATIO = 1.20
@@ -282,18 +291,26 @@ def main() -> int:
         "per-token logits as the monolithic version. The vendored submodule is NOT "
         "modified on disk; the patch is applied in-process via monkeypatch.\n"
         "\n"
-        "- **Lowered `--eval-batch-size` (64 → 8) plus OOM-class normalisation.** "
-        "The base-eval `model.generate` path OOMs on 12 GB at the vendored default "
-        "batch of 64. The eval already has a divide-and-conquer retry "
-        "(`locomo_delta.py:600-665`) that halves the batch on `torch.OutOfMemoryError` "
-        "but the kernel raises a generic `RuntimeError(\"CUDA error: out of memory\")` "
-        "from inside SDPA mask construction, which the bisector does not catch. "
-        "We (a) set the initial batch to 8 so most samples complete first try, and "
-        "(b) wrap `_generate_prompt_chunk` to re-raise CUDA-OOM `RuntimeError`s as "
-        "`torch.OutOfMemoryError` so the existing bisector engages and halves to "
-        "4/2/1 when needed. Greedy scoring (the LoCoMo `overall_score` path uses "
-        "`do_sample=False`) is batch-size-invariant, so this changes peak VRAM "
-        "and runtime only, not numerics.\n"
+        "- **Lowered `--eval-batch-size` (64 → 2).** "
+        "Each base-eval prompt is `history_messages + question` (~17.6k tokens), "
+        "so 8 GB weights + N × ~0.6 GB KV-cache + SDPA prefill scratch limits us "
+        "to ~2 prompts in parallel on a 12 GB card. The vendored eval has a "
+        "divide-and-conquer retry (`locomo_delta.py:600-665`) that halves the "
+        "batch on `torch.OutOfMemoryError`, but the kernel raises a generic "
+        "`RuntimeError(\"CUDA error: out of memory\")` from inside SDPA mask "
+        "construction, which the bisector does not catch. We tried batch=8 with "
+        "a defence-in-depth wrapper that re-raises CUDA-OOM `RuntimeError`s as "
+        "`torch.OutOfMemoryError`, and the bisector did engage — but the CUDA "
+        "OOM recovery itself crashed the process on this host "
+        "(Windows `STATUS_STACK_BUFFER_OVERRUN`, 0xC0000409). We therefore size "
+        "the initial batch to fit every sample first-try at 2, and keep the "
+        "OOM-class normalisation as a safety net only.\n"
+        "\n"
+        "  Greedy scoring (the LoCoMo `overall_score` path uses `do_sample=False`) "
+        "is batch-size-invariant, so this changes peak VRAM and runtime only, not "
+        "the headline numerics. Sampling-only history-replay probes (history_*) "
+        "see a different RNG stream at a different batch size, which is already "
+        "true at the vendored default of 64 vs any alternative.\n"
         "\n"
         "  See the \"Eval config\" section below for the same facts recorded in the "
         "config dict (`methodology_adjustment` and `eval_batch_size` keys).\n"
