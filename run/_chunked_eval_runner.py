@@ -194,29 +194,51 @@ def _build_full_prompt_tokens(model, tokenizer, sample, question, *, seed, quest
 
 
 def _compute_history_len(model, tokenizer, sample, *, seed, answer_reserve_tokens):
-    """Pre-compute the common-prefix token count across questions in a sample.
+    """Compute the longest token prefix shared by ALL questions in the sample.
 
-    Tokenizes the FIRST TWO questions' full prompts and finds their longest
-    common prefix; that's the system+context portion shared across all
-    questions in this conversation. Falls back to None (no caching) when the
-    sample has fewer than 2 questions.
+    `build_official_context_text` computes per-question token budgets to decide
+    truncation, so even when truncation isn't triggered the tokenization
+    boundary between context_text and question can shift with question length
+    (e.g. the tokenizer merging the final '\\n\\n' with the first character of
+    the question prompt). A common prefix computed from just two questions can
+    overshoot the true shared prefix and produce a `rebuilt=True` cache miss
+    on a later question — which triggers a monolithic re-prefill and OOMs on
+    a 12 GB card.
+
+    To stay safe we tokenize every question's prompt up-front and compute the
+    intersection. Per-question tokenization is fast (CPU/MPS-style work, no
+    GPU forward) so this is a one-time per-conversation overhead well below
+    the first question's prefill cost.
+
+    Returns None for single-question samples (no benefit from caching).
     """
     qa_items = sample["qa"]
     if len(qa_items) < 2:
         return None
-    _, _, ids0 = _build_full_prompt_tokens(
-        model, tokenizer, sample, qa_items[0],
-        seed=seed, question_index=0,
-        answer_reserve_tokens=answer_reserve_tokens,
-    )
-    _, _, ids1 = _build_full_prompt_tokens(
-        model, tokenizer, sample, qa_items[1],
-        seed=seed, question_index=1,
-        answer_reserve_tokens=answer_reserve_tokens,
-    )
-    min_len = min(int(ids0.shape[1]), int(ids1.shape[1]))
-    eq = (ids0[0, :min_len] == ids1[0, :min_len]).to(torch.long)
-    history_len = int(eq.cumprod(0).sum().item())
+
+    all_ids = []
+    for idx, qa in enumerate(qa_items):
+        _, _, ids = _build_full_prompt_tokens(
+            model, tokenizer, sample, qa,
+            seed=seed, question_index=idx,
+            answer_reserve_tokens=answer_reserve_tokens,
+        )
+        all_ids.append(ids[0])
+
+    min_len = min(int(t.shape[0]) for t in all_ids)
+    base = all_ids[0][:min_len]
+    common = torch.ones(min_len, dtype=torch.bool)
+    for t in all_ids[1:]:
+        common &= t[:min_len] == base
+    # Longest contiguous-from-position-0 prefix where all match.
+    if not common[0]:
+        return 0
+    # Find first False (divergence point).
+    false_positions = (~common).nonzero(as_tuple=False)
+    if false_positions.numel() == 0:
+        history_len = min_len
+    else:
+        history_len = int(false_positions[0].item())
     return history_len
 
 
@@ -339,9 +361,30 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    if cache_entry.get("disabled", True):
-        # Fallback: full fresh prefill per question. Matches the non-cached
-        # patch behaviour we previously committed.
+    cache_hit_attempt = not cache_entry.get("disabled", True)
+    if cache_hit_attempt:
+        # Sanity check: the cached history must be a true prefix of this
+        # prompt. If not, the cache is poisoned — fall back to a fresh
+        # chunked prefill rather than letting _ingest_full_ids trigger
+        # `rebuilt=True` and OOM on a 12 GB card.
+        history_len = cache_entry["history_len"]
+        cached_prefix = cache_entry["history_processed_ids"][0].to(prompt_ids.device)
+        if (
+            int(prompt_ids.shape[1]) < history_len
+            or not torch.equal(prompt_ids[0, :history_len], cached_prefix[:history_len])
+        ):
+            print(
+                f"[kv-cache MISS sample={sample['sample_id']} q{question_index}] "
+                f"prompt prefix diverges from cached history at len<={history_len}; "
+                f"falling back to fresh chunked prefill.",
+                flush=True,
+            )
+            cache_hit_attempt = False
+
+    if not cache_hit_attempt:
+        # Fallback: fresh chunked prefill from scratch (no cross-question
+        # reuse). Matches the non-cached patch behaviour we previously
+        # validated.
         reset_delta_mem_states(model)
         session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
         session.messages = [dict(m) for m in prompt_messages]
@@ -360,10 +403,16 @@ def _chunked_official_full_history_answer(
         chunk_idx += 1
         last_logits = session._ingest_full_ids(prompt_ids[:, :end])
         stats = session.last_ingest_stats
-        if chunk_idx > 1 and stats.get("rebuilt", False):
+        # Trip the safety check on the FIRST chunk too if we're trying to
+        # reuse the cache — `rebuilt=True` here means the cached past_kv
+        # was just thrown away and a full monolithic prefill is about to
+        # run (37 GB OOM on 12 GB).
+        rebuilt = stats.get("rebuilt", False)
+        if rebuilt and (chunk_idx > 1 or cache_hit_attempt):
             raise RuntimeError(
-                f"Chunked official prefill defeated at chunk {chunk_idx}: "
-                f"stats={stats}. Common-prefix invariant violated."
+                f"Chunked official prefill defeated at chunk {chunk_idx} "
+                f"(cache_hit={cache_hit_attempt}): stats={stats}. "
+                f"Common-prefix invariant violated."
             )
 
     if last_logits is None:
