@@ -108,6 +108,126 @@ def _oom_normalised_generate_prompt_chunk(*args, **kwargs):
 eval_mod._generate_prompt_chunk = _oom_normalised_generate_prompt_chunk
 
 
+# --- Third controller-approved patch: chunked prefill for official_prompt mode ---
+# The vendored generate_official_full_history_answer (locomo_delta.py:420-479)
+# builds a 2-message prompt (system + user[context+question], ~17.6k tokens) and
+# calls model.generate(input_ids=...) directly. PyTorch SDPA without flash-attn
+# (we're on Windows / Ampere / no flash_attn package) picks the MATH backend on
+# long sequences, which materialises the full O(N²) attention scratch:
+# 1 × 32 heads × 17600² × 2 bytes ≈ 20 GB per layer at peak — tried to allocate
+# 37 GB on first attempt, OOM on a 12 GB card.
+#
+# We replace it with a DeltaMemChatSession-driven chunked prefill (same
+# mechanism as the snapshot patch above): _ingest_full_ids in ~1k-token chunks
+# uses prefix-skip so each forward only computes attention against the new
+# suffix tokens — peak scratch shrinks to chunk² + KV-extension cost. After
+# prefill, we sample tokens via session._decode_generate using the same
+# temperature / top_k / top_p as the vendored sampler.
+#
+# Numerical equivalence: token-granularity delta-mem writes (this adapter's
+# config) are autoregressive accumulations of per-token Q/K/V projections —
+# identical between chunked and monolithic prefill (delta_impl.py:2173-2184).
+# KV cache is identical. Final-position logits are bit-identical on
+# deterministic forwards. Sampling consumes RNG identically because we seed
+# inside fork_rng with seed=seed+question_index, matching the vendored
+# function (locomo_delta.py:458).
+
+from deltamem.eval.locomo_protocol import (
+    OFFICIAL_TEMPERATURE,
+    OFFICIAL_TOP_P,
+    OFFICIAL_TOP_K,
+    prepare_locomo_question,
+    infer_model_context_window,
+    build_official_full_history_messages,
+    canonicalize_locomo_prediction,
+)
+
+
+_OFFICIAL_PREFILL_CHUNK = 1024
+
+
+def _chunked_official_full_history_answer(
+    model,
+    tokenizer,
+    device,
+    sample,
+    question,
+    *,
+    question_index,
+    seed,
+    max_new_tokens,
+    answer_reserve_tokens,
+    do_sample=True,
+    temperature=OFFICIAL_TEMPERATURE,
+    top_p=OFFICIAL_TOP_P,
+    top_k=OFFICIAL_TOP_K,
+):
+    question_spec = prepare_locomo_question(
+        question,
+        sample_id=str(sample["sample_id"]),
+        question_index=question_index,
+        seed=seed,
+    )
+    max_context_tokens = infer_model_context_window(model, tokenizer)
+    prompt_messages = build_official_full_history_messages(
+        sample,
+        tokenizer,
+        question_spec,
+        max_context_tokens=max_context_tokens,
+        answer_reserve_tokens=answer_reserve_tokens,
+    )
+
+    reset_delta_mem_states(model)
+    session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
+    session.messages = [dict(m) for m in prompt_messages]
+    prompt_ids = session._tokenize_messages(prompt_messages, add_generation_prompt=True)
+
+    total = int(prompt_ids.shape[1])
+    last_logits = None
+    end = 0
+    chunk_idx = 0
+    while end < total:
+        end = min(end + _OFFICIAL_PREFILL_CHUNK, total)
+        chunk_idx += 1
+        last_logits = session._ingest_full_ids(prompt_ids[:, :end])
+        stats = session.last_ingest_stats
+        if chunk_idx > 1 and stats.get("rebuilt", False):
+            raise RuntimeError(
+                f"Chunked official prefill defeated at chunk {chunk_idx}: "
+                f"stats={stats}. Common-prefix invariant violated."
+            )
+    if last_logits is None:
+        raise RuntimeError("Empty official-prompt; cannot generate.")
+    print(
+        f"[official-prefill q{question_index}] chunks={chunk_idx} "
+        f"total_tokens={total} final_suffix_ms={stats.get('elapsed_ms', '?')}",
+        flush=True,
+    )
+
+    rng_devices = []
+    if torch.cuda.is_available() and device.startswith("cuda"):
+        rng_devices = [torch.device(device)]
+    with torch.random.fork_rng(devices=rng_devices):
+        torch.manual_seed(seed + question_index)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed + question_index)
+        generated_ids = session._decode_generate(
+            last_logits,
+            max_new_tokens,
+            do_sample=do_sample,
+            temperature=OFFICIAL_TEMPERATURE if temperature is None else float(temperature),
+            top_p=OFFICIAL_TOP_P if top_p is None else float(top_p),
+            top_k=OFFICIAL_TOP_K if top_k in (None, 0) else int(top_k),
+        )
+
+    raw_prediction = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+    canonical_prediction = canonicalize_locomo_prediction(raw_prediction, question_spec)
+    return raw_prediction, canonical_prediction
+
+
+eval_mod.generate_official_full_history_answer = _chunked_official_full_history_answer
+
+
 # Re-shape sys.argv so the eval's argparse sees the expected program name
 # rather than "run._chunked_eval_runner". Cosmetic but cleaner help output.
 sys.argv[0] = "deltamem.eval.locomo_delta"

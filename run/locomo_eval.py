@@ -92,14 +92,19 @@ EVAL_CONFIG = {
     # the chosen size. Greedy scoring (do_sample=False) is batch-invariant.
     "eval_batch_size": 2,
     "methodology_adjustment": (
-        "build_teacher_forced_snapshot chunked via run/_chunked_eval_runner.py "
-        "(per-message ingestion; mathematically equivalent to vendored version "
-        "but bounded VRAM); --eval-batch-size lowered to 2 to fit 17.6k-token "
-        "prompts on 12 GB without triggering the vendored OOM bisector, which "
-        "crashed the process (STATUS_STACK_BUFFER_OVERRUN) on this host when "
-        "recovering from CUDA OOM; _generate_prompt_chunk also wrapped so "
-        "non-typed CUDA-OOM RuntimeErrors re-raise as torch.OutOfMemoryError "
-        "as a defence-in-depth safeguard"
+        "Switched --full-history-mode to official_prompt (the protocol used "
+        "by the vendored benchmark suite at scripts/run_qasper_multimodel_*); "
+        "monolithic 17.6k-token model.generate prefill in that mode OOMs "
+        "(SDPA MATH backend tries to allocate ~37 GB on a 12 GB card), so "
+        "generate_official_full_history_answer is monkeypatched to use "
+        "DeltaMemChatSession chunked prefill (~1k-token chunks via "
+        "_ingest_full_ids' prefix-skip), mathematically equivalent because "
+        "token-granularity delta-mem writes are autoregressive accumulations "
+        "(delta_impl.py:2173-2184). Sampling consumes RNG identically to the "
+        "vendored function (same seed=seed+question_index inside fork_rng). "
+        "build_teacher_forced_snapshot chunked-prefill patch and _generate_prompt_chunk "
+        "OOM-class normalisation remain in the runner but are inert in "
+        "official_prompt mode."
     ),
 }
 PAPER_RATIO = 1.20
