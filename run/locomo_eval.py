@@ -72,6 +72,14 @@ EVAL_CONFIG = {
     "attn_implementation": "sdpa",
     "max_seq_len": _QWEN3_4B_MAX_POSITION_EMBEDDINGS,
     "scan_impl": "torch",  # see report/kernels-gate.md
+    # Use the paper's official prompting protocol (matches the vendored
+    # benchmark suite at delta-Mem/scripts/run_qasper_multimodel_write8192_benchmark_suite.sh).
+    # The newer `history_replay` mode produces bit-identical predictions
+    # between base and delta on a small partial run — likely because the
+    # full history is in the prompt and temperature=0.4/top_k=10/top_p=0.9
+    # sampling lockstep with the same seed lands on the same tokens, so the
+    # signal is buried. The paper's 1.20x was measured under official_prompt.
+    "full_history_mode": "official_prompt",
     # Default 2 (vs vendored 64) to fit base-eval generate() inside 12 GB on
     # the RTX 3060. Each base-eval prompt is history_messages + question
     # (~17.6k + question tokens), so 8 GB weights + N x ~0.6 GB KV + SDPA
@@ -142,6 +150,7 @@ def _invoke_vendored_eval(
         "--dtype", EVAL_CONFIG["dtype"],
         "--attn-implementation", EVAL_CONFIG["attn_implementation"],
         "--eval-batch-size", str(EVAL_CONFIG["eval_batch_size"]),
+        "--full-history-mode", EVAL_CONFIG["full_history_mode"],
         "--output-json", str(output_json),
     ]
     if max_conversations is not None:
