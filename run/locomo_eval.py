@@ -140,6 +140,7 @@ def _invoke_vendored_eval(
     output_json: Path,
     max_conversations: Optional[int] = None,
     max_questions_per_conversation: Optional[int] = None,
+    data_file: Optional[str] = None,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -171,6 +172,8 @@ def _invoke_vendored_eval(
         cmd += ["--max-conversations", str(max_conversations)]
     if max_questions_per_conversation is not None:
         cmd += ["--max-questions-per-conversation", str(max_questions_per_conversation)]
+    if data_file is not None:
+        cmd += ["--data-file", data_file]
 
     log_path = RAW_DIR / "locomo-stdout.log"
     print(f"Running: {' '.join(cmd)}")
@@ -261,6 +264,12 @@ def main() -> int:
              "validating optimisation patches (e.g. KV-cache reuse) against a "
              "small reference set before scaling up.",
     )
+    parser.add_argument(
+        "--data-file",
+        default=None,
+        help="Override the vendored eval's data file (default: data/locomo10.json "
+             "relative to repo root). Use to run on a custom subset.",
+    )
     args = parser.parse_args()
 
     output_json = Path(args.output_json)
@@ -286,6 +295,7 @@ def main() -> int:
         output_json=output_json,
         max_conversations=args.max_conversations,
         max_questions_per_conversation=args.max_questions_per_conversation,
+        data_file=args.data_file,
     )
     dm, fz, skipped = _extract_ratios(scores_path)
 
