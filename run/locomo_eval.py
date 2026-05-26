@@ -141,6 +141,7 @@ def _invoke_vendored_eval(
     max_conversations: Optional[int] = None,
     max_questions_per_conversation: Optional[int] = None,
     data_file: Optional[str] = None,
+    turboquant_bits: int = 0,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -177,13 +178,17 @@ def _invoke_vendored_eval(
 
     log_path = RAW_DIR / "locomo-stdout.log"
     print(f"Running: {' '.join(cmd)}")
+    subprocess_env = {**os.environ, "DELTA_MEM_SCAN_IMPL": "torch"}
+    if turboquant_bits > 0:
+        subprocess_env["TURBOQUANT_BITS"] = str(turboquant_bits)
+        print(f"  TURBOQUANT_BITS={turboquant_bits} (KV cache quantised; cross-question cache reuse disabled)")
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(
             cmd,
             cwd=REPO_ROOT,
             stdout=log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "DELTA_MEM_SCAN_IMPL": "torch"},
+            env=subprocess_env,
         )
     if proc.returncode != 0:
         sys.stderr.write(
@@ -270,6 +275,15 @@ def main() -> int:
         help="Override the vendored eval's data file (default: data/locomo10.json "
              "relative to repo root). Use to run on a custom subset.",
     )
+    parser.add_argument(
+        "--turboquant-bits",
+        type=int,
+        default=0,
+        help="If > 0, quantise the KV cache to this bit-width via TurboQuant "
+             "(4 = 4-bit; 3 = 3-bit). Disables cross-question KV-cache reuse "
+             "(TurboQuantCache.crop is unsafe on quantised layers). Pass 0 "
+             "to keep bf16 KV with cache reuse (default).",
+    )
     args = parser.parse_args()
 
     output_json = Path(args.output_json)
@@ -296,7 +310,15 @@ def main() -> int:
         max_conversations=args.max_conversations,
         max_questions_per_conversation=args.max_questions_per_conversation,
         data_file=args.data_file,
+        turboquant_bits=args.turboquant_bits,
     )
+
+    if args.turboquant_bits > 0:
+        EVAL_CONFIG["turboquant_bits"] = args.turboquant_bits
+        EVAL_CONFIG["kv_cache"] = (
+            f"TurboQuant {args.turboquant_bits}-bit "
+            "(residual-window 128 tokens FP16; cross-question reuse disabled)"
+        )
     dm, fz, skipped = _extract_ratios(scores_path)
 
     ratio = dm / fz if fz > 0 else float("nan")

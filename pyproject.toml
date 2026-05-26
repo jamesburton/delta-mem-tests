@@ -15,6 +15,11 @@ dependencies = [
     "tqdm",
     "ninja",
     "psutil",
+    # KV-cache quantization for the TurboQuant + delta-mem experiment.
+    # Provides TurboQuantCache (DynamicCache subclass) with 3/4-bit quantization
+    # of K/V tensors plus a 128-token FP16 residual window. Used only when
+    # --turboquant-bits N is passed to run.locomo_eval.
+    "turboquant>=0.2.0",
 ]
 
 [project.optional-dependencies]

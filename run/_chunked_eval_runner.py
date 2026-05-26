@@ -32,6 +32,21 @@ import deltamem.eval.locomo_delta as eval_mod
 from deltamem.core import reset_delta_mem_states
 from deltamem.runtime.session import DeltaMemChatSession
 
+# Optional KV-cache quantization via TurboQuant. Enabled by setting
+# TURBOQUANT_BITS env var to a positive integer (e.g. 4 or 3). When enabled:
+#   * the per-conversation KV-cache reuse path is bypassed because
+#     TurboQuantCache inherits crop() from DynamicCache but its quantized
+#     layers don't implement crop in a way that preserves correctness
+#   * each question's chunked prefill starts with a fresh TurboQuantCache
+#     so K/V are compressed to N bits in-flight; the last 128 tokens stay
+#     FP16 (TurboQuant's "residual window") so decoding precision matches
+#     the vendored path on recent positions
+# Set to 0 (or unset) to keep the existing bf16 + KV-cache-reuse path.
+TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "0"))
+TurboQuantCache = None
+if TURBOQUANT_BITS > 0:
+    from turboquant import TurboQuantCache  # noqa: F401
+
 
 def _chunked_build_teacher_forced_snapshot(model, tokenizer, device, history):
     """Drop-in replacement for the vendored function. Processes the history
@@ -361,7 +376,13 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    cache_hit_attempt = not cache_entry.get("disabled", True)
+    # When TurboQuant KV is active, force the fresh-prefill path. Cross-
+    # question cache reuse depends on Cache.crop(); TurboQuantCache's
+    # quantized layers don't preserve correctness under crop, so reusing
+    # a cropped cache would feed corrupted K/V to subsequent decode.
+    cache_hit_attempt = (
+        TURBOQUANT_BITS == 0 and not cache_entry.get("disabled", True)
+    )
     if cache_hit_attempt:
         # Sanity check: the cached history must be a true prefix of this
         # prompt. If not, the cache is poisoned — fall back to a fresh
@@ -384,10 +405,14 @@ def _chunked_official_full_history_answer(
     if not cache_hit_attempt:
         # Fallback: fresh chunked prefill from scratch (no cross-question
         # reuse). Matches the non-cached patch behaviour we previously
-        # validated.
+        # validated. When TURBOQUANT_BITS > 0, seed the session with a
+        # fresh TurboQuantCache so that the entire chunked prefill plus
+        # the per-token decode forwards push K/V into the quantized cache.
         reset_delta_mem_states(model)
         session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
         session.messages = [dict(m) for m in prompt_messages]
+        if TURBOQUANT_BITS > 0:
+            session.past_key_values = TurboQuantCache(bits=TURBOQUANT_BITS)
         ingest_start = 0
     else:
         session = cache_entry["session"]
@@ -422,8 +447,9 @@ def _chunked_official_full_history_answer(
 
     if last_logits is None:
         raise RuntimeError("Empty official-prompt; cannot generate.")
+    tq_tag = f" tq{TURBOQUANT_BITS}" if TURBOQUANT_BITS > 0 else ""
     print(
-        f"[official-prefill q{question_index} sample={sample['sample_id']}] "
+        f"[official-prefill q{question_index} sample={sample['sample_id']}{tq_tag}] "
         f"suffix_chunks={chunk_idx} ingest_start={ingest_start} total={total} "
         f"final_chunk_ms={stats.get('elapsed_ms', '?')}",
         flush=True,

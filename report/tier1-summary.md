@@ -85,3 +85,37 @@ A. **Try a different adapter.** If anyone has the SSW/TSW/MSW QASPER-trained che
 B. **Or: keep the current adapter, run the remaining seven conversations.** ~3 days of wall time produces the real reproduction number under the published adapter, comparable apples-to-apples to the paper if the published adapter is in fact what they used.
 
 C. **Or: ship Tier 1 as-is with this summary as the deliverable.** The reproduction *protocol* is correct (matches the vendored benchmark script), the patches that made it fit the hardware are documented and validated, and the honest finding is that 3 of 10 conversations under the public adapter don't show the paper's lift. That is itself a result.
+
+## Appendix A: does the compressed delta-mem state alone preserve enough context?
+
+The `full_history_replay` mode above is a "delta-mem on top of full attention" test, not a "delta-mem replacing the conversation history" test. The latter — feeding the model only its compressed delta-mem state plus the question, with no history in the prompt — is closer to delta-mem's intended long-context-compression value. We ran it on conv-0 (152 questions, categories 1–4) via `run/delta_only_eval.py`.
+
+| Condition | Memory of history | overall | multi_hop | temporal | open_domain | single_hop |
+|---|---|---:|---:|---:|---:|---:|
+| **truncated_base** | none — model gets just the question | **0.0591** | 0.0341 | 0.0036 | 0.1468 | 0.0837 |
+| **delta_only** | compressed delta-mem state only | **0.1064** | 0.0648 | 0.0713 | 0.1634 | 0.1335 |
+| full_history_base (from main result) | full ~17.6k-token history in prompt | 0.3617 | 0.3223 | 0.3866 | 0.1145 | 0.4125 |
+| full_history_delta (from main result) | full history *and* delta state | 0.3644 | 0.3213 | 0.3852 | 0.1229 | 0.4179 |
+
+**Takeaways:**
+
+- **Delta-mem captures real information.** `delta_only / truncated_base = 1.80×` on overall score. The state isn't decorative — it's storing recoverable signal from the conversation.
+- **The signal is strongest where memory matters most.** Temporal questions (`when did X happen`) jump from 0.0036 → 0.0713 — a 20× lift over the no-memory baseline. Single-hop fact recall and multi-hop reasoning both roughly double.
+- **Open-domain is the exception.** truncated_base actually beats full_history_base on this category (0.1468 vs 0.1145); these questions don't need the conversation. So delta_only's small lift here (1.11×) is unsurprising.
+- **But compression is lossy.** `delta_only / full_history_delta = 0.29×`. On context that *fits in attention* (17.6k tokens fits comfortably in 12 GB), full attention beats compressed memory by ~3×. Delta-mem is not a drop-in replacement; it's a compressed-memory fallback for the regime where full KV won't fit.
+
+**Memory budget at 12 GB with this approach:** weights (~8 GB) + delta-mem state (~300 MB) + tiny KV for the ~100-token question prompt + scratch ≈ 9 GB. Plenty of headroom. The conv-0 run completed in ~50 min including ~17 min of one-time history-prefill — much cheaper than the `full_history_replay` path which is ~4 h per condition.
+
+**Implication for the long-context use case:** this is the experiment that *would* matter on a 100k-token problem, where full KV is multiple GB and won't fit alongside weights on a 12 GB card. The break-even point — at what context length does (delta-mem of N tokens + short prompt) beat (full attention of the M tokens that fit) — needs a longer-context dataset and ideally a bigger machine to set the comparison ceiling. The current data says delta-mem is real; what's missing is the regime where it's the *only* option.
+
+## Appendix B: TurboQuant + delta-mem (planned)
+
+A follow-up experiment is staged but not yet run. The hypothesis: TurboQuant 4-bit KV quantisation (`turboquant 0.2.0`, `TurboQuantCache` drop-in for `DynamicCache`) shrinks the per-question KV cache ~4× (last 128 tokens stay FP16 as a residual window). Delta-mem's compressed state runs alongside it. If quality holds across the four conditions (bf16/TQ4 × no-adapter/adapter), the same VRAM budget supports meaningfully longer context — which is the regime where delta-mem's value shows up (Appendix A).
+
+Wired in:
+
+- `pyproject.toml` adds `turboquant>=0.2.0`.
+- `run/_chunked_eval_runner.py` honours `TURBOQUANT_BITS` env var; when set it disables the per-conversation KV-cache reuse path (TurboQuantCache's quantised layers don't preserve correctness under `crop()`) and seeds each fresh session with `TurboQuantCache(bits=N)`.
+- `run/locomo_eval.py --turboquant-bits N` plumbs the flag through and records it in `EVAL_CONFIG`.
+
+Runtime budget on conv-0 with cache reuse disabled is ~25 h for the full 152 × 2 conditions; a smoke at `--max-questions-per-conversation 10` (~100 min) validates quality before scaling up. Results pending.
