@@ -45,6 +45,12 @@ from deltamem.runtime.session import DeltaMemChatSession
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "0"))
 TurboQuantCache = None
 if TURBOQUANT_BITS > 0:
+    # turboquant 0.2.0 calls np.trapz which was removed in numpy 2.0 (renamed
+    # to np.trapezoid). Restore the alias before importing turboquant; this
+    # is the minimal patch and is bit-identical to the original function.
+    import numpy as _np
+    if not hasattr(_np, "trapz") and hasattr(_np, "trapezoid"):
+        _np.trapz = _np.trapezoid
     from turboquant import TurboQuantCache  # noqa: F401
 
 
