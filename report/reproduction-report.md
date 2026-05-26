@@ -14,19 +14,19 @@ Three in-process monkeypatches applied in `run/_chunked_eval_runner.py`. All are
   Numerical note: chunked + cached prefill is equivalent to monolithic prefill in the infinite-precision limit. In bf16, GEMM kernel selection at different chunk sizes can perturb long-form sampled outputs by a few tokens; per-question score and overall ratio agree to the reported precision on the validation slice we checked.
 
 See the "Eval config" section below for `methodology_adjustment` and related keys recorded with this run.
-**Verdict:** OUT_OF_BAND
+**Verdict:** REGRESSION
 
 ## Headline
 
-- Our delta-mem-vs-frozen-backbone ratio: **1.01×**
+- Our delta-mem-vs-frozen-backbone ratio: **0.98×**
 - Paper's reported ratio: **1.20×**
 - Tolerance band: **±0.05**
-- Deviation from paper: **0.19**
+- Deviation from paper: **0.22**
 
 ## Scores
 
-- delta-mem score: **0.3644**
-- frozen backbone score: **0.3617**
+- delta-mem score: **0.3866**
+- frozen backbone score: **0.3945**
 
 ## Run metadata
 
@@ -51,4 +51,4 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Investigation note
 
-Our ratio differs from the paper by 0.19, which exceeds the ±0.05 tolerance. Per the spec, this is a finding to investigate, not to smooth over. See the raw outputs under `report/raw/` for the per-sample breakdown.
+Our ratio of 0.98 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
