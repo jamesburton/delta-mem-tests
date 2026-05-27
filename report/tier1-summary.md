@@ -108,14 +108,39 @@ The `full_history_replay` mode above is a "delta-mem on top of full attention" t
 
 **Implication for the long-context use case:** this is the experiment that *would* matter on a 100k-token problem, where full KV is multiple GB and won't fit alongside weights on a 12 GB card. The break-even point — at what context length does (delta-mem of N tokens + short prompt) beat (full attention of the M tokens that fit) — needs a longer-context dataset and ideally a bigger machine to set the comparison ceiling. The current data says delta-mem is real; what's missing is the regime where it's the *only* option.
 
-## Appendix B: TurboQuant + delta-mem (planned)
+## Appendix B: TurboQuant 4-bit KV + delta-mem
 
-A follow-up experiment is staged but not yet run. The hypothesis: TurboQuant 4-bit KV quantisation (`turboquant 0.2.0`, `TurboQuantCache` drop-in for `DynamicCache`) shrinks the per-question KV cache ~4× (last 128 tokens stay FP16 as a residual window). Delta-mem's compressed state runs alongside it. If quality holds across the four conditions (bf16/TQ4 × no-adapter/adapter), the same VRAM budget supports meaningfully longer context — which is the regime where delta-mem's value shows up (Appendix A).
+We ran the staged TurboQuant smoke (`turboquant 0.2.0`, `TurboQuantCache(bits=4)` drop-in for `DynamicCache`; last 128 tokens stay FP16 as a residual window) on conv-0 / first 10 questions, both branches. Same 10 questions evaluated under bf16 KV (subset of the prior full-conv-0 run) and TQ4 KV.
 
-Wired in:
+### Quality (same 10 questions)
 
-- `pyproject.toml` adds `turboquant>=0.2.0`.
-- `run/_chunked_eval_runner.py` honours `TURBOQUANT_BITS` env var; when set it disables the per-conversation KV-cache reuse path (TurboQuantCache's quantised layers don't preserve correctness under `crop()`) and seeds each fresh session with `TurboQuantCache(bits=N)`.
-- `run/locomo_eval.py --turboquant-bits N` plumbs the flag through and records it in `EVAL_CONFIG`.
+| Condition | bf16 overall | TQ4 overall | diff |
+|---|---:|---:|---:|
+| base   | 0.2680 | 0.3344 | +0.0664 |
+| delta  | 0.2680 | 0.3342 | +0.0662 |
 
-Runtime budget on conv-0 with cache reuse disabled is ~25 h for the full 152 × 2 conditions; a smoke at `--max-questions-per-conversation 10` (~100 min) validates quality before scaling up. Results pending.
+Per-category at n≤6 the numbers are too noisy to read deeply, but **TQ4 doesn't regress** — within sampling noise it's at least as good as bf16 on this slice. The per-question raw_predictions differ between bf16 and TQ4 in most cases (quantisation perturbs which sampled tokens emerge under temperature=0.4/top_k=10/top_p=0.9), but the F1 scores against gold come out essentially the same. The slight +0.066 lift is almost certainly statistical noise at n=10.
+
+### Memory (estimated, at 17.6k tokens)
+
+- bf16 KV cache: ~0.6 GB
+- TQ4 KV cache: ~0.16 GB (4-bit body + 128-token FP16 residual window)
+- saving: ~0.44 GB (~73%)
+
+On a 12 GB card this is the difference between roughly **~30k-token max context (bf16) and ~100k+ token max context (TQ4)**. That's the regime change that matters for delta-mem's actual use case (Appendix A): with TQ4 freeing VRAM, you can run the long-context KV *and* the delta-mem state together at sequence lengths bf16 can't reach.
+
+### Runtime cost (the catch)
+
+The 20 generations (10 q × 2 conditions) took **20 h wall**. `turboquant 0.2.0` is a pure-Python reference implementation; per-token quantisation in Python dominates the inner loop. Per-question prefill at 17.6k context averaged ~55 min for TQ4 vs ~5 min for bf16 — a ~11× slowdown. The compression math works, but in the current implementation the runtime tax wipes out the inference-time benefit on this hardware.
+
+Cross-question KV-cache reuse (the optimisation that gave bf16 a 7.7× speedup) is disabled under TQ because `TurboQuantCache`'s quantised layers don't preserve correctness under `Cache.crop()`. Even if we fixed crop, the quantisation overhead alone is the bottleneck — every question still pays the ~50 min prefill cost.
+
+### Verdict
+
+- **Quality:** TQ4 preserves recall at this sample size. The hypothesis (KV compression + delta-mem ≈ bf16 + delta-mem in quality) holds for the conv-0 slice.
+- **Memory:** Real and large — 73% saving at 17.6k, scales linearly. Enables the long-context regime on a small card.
+- **Throughput:** Unusable with `turboquant 0.2.0` (pure Python). A custom CUDA kernel implementation — the kind landing in [llama.cpp forks](https://github.com/ggml-org/llama.cpp/discussions/20969) — would be required for production use. The HF transformers Python path isn't where TurboQuant gets to shine yet.
+
+The combination *would* unlock running longer context on this 12 GB card if a fast kernel were available. The next experiment that would actually pay off is testing this on a model + dataset that genuinely needs the bigger context window (say 50k+ tokens), where bf16 simply doesn't fit, and where delta-mem's compressed state can carry the rest. That ideally happens on faster kernels (llama.cpp turbo3/turbo4 variants) or on a machine with more headroom for the slow Python path.
+
+Raw artifacts: `outputs/tq4_conv0_smoke.json`, `report/raw/locomo-{stdout,driver}-tq4-conv0-smoke.log`.

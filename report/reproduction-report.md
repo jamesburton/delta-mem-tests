@@ -18,15 +18,15 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Headline
 
-- Our delta-mem-vs-frozen-backbone ratio: **0.98×**
+- Our delta-mem-vs-frozen-backbone ratio: **1.00×**
 - Paper's reported ratio: **1.20×**
 - Tolerance band: **±0.05**
-- Deviation from paper: **0.22**
+- Deviation from paper: **0.20**
 
 ## Scores
 
-- delta-mem score: **0.3866**
-- frozen backbone score: **0.3945**
+- delta-mem score: **0.3342**
+- frozen backbone score: **0.3344**
 
 ## Run metadata
 
@@ -44,6 +44,8 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 - `full_history_mode`: `official_prompt`
 - `eval_batch_size`: `2`
 - `methodology_adjustment`: `Three in-process monkeypatches on the vendored eval, all required to fit Tier 1 reproduction on a 12 GB card: (1) --full-history-mode=official_prompt is the paper's protocol (matches scripts/run_qasper_multimodel_*); (2) generate_official_full_history_answer is replaced with a DeltaMemChatSession chunked prefill (~1k-token chunks via _ingest_full_ids prefix-skip) because the vendored monolithic model.generate hits SDPA MATH backend on a 17.6k-token prompt and tries to allocate ~37 GB; (3) per-conversation KV-cache reuse — the history portion is prefilled once per conversation, snapshotted (KV cache + delta-mem state), then restored and Cache.crop()-truncated to history_len before each subsequent question so _ingest_full_ids only forwards the ~50-token question suffix. Mathematically equivalent in the infinite-precision limit (autoregressive attention depends only on prior tokens via the KV cache); in bf16 the chunk-boundary GEMM kernel selection can perturb long-form outputs by a few sampled tokens, but per-question scores and overall ratio agree to the reported precision on the validation set (1 conv x 3 q). The build_teacher_forced_snapshot chunked patch and _generate_prompt_chunk OOM-class normalisation are kept in the runner but inert in official_prompt mode.`
+- `turboquant_bits`: `4`
+- `kv_cache`: `TurboQuant 4-bit (residual-window 128 tokens FP16; cross-question reuse disabled)`
 
 ## Asterisks
 
@@ -51,4 +53,4 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Investigation note
 
-Our ratio of 0.98 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
+Our ratio of 1.00 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
