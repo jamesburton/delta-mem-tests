@@ -8,7 +8,17 @@ Prerequisites on native Windows 11:
    Task 3. For Task 2, the driver alone is sufficient because `torch==2.5.1+cu121`
    ships its own CUDA runtime libraries.
 3. Visual Studio Build Tools (MSVC) installed — required by Task 3 for
-   ninja-driven kernel compilation, not Task 2.
+   ninja-driven kernel compilation, not Task 2. **Also required for the
+   2-bit KV experiments** (`optimum-quanto` JIT-compiles a CUDA extension
+   the first time it dequantises). Tick the "Windows 11 SDK" individual
+   component too — vcvars64.bat puts `cl.exe` on PATH but won't find the
+   C runtime headers (`stddef.h` etc.) without the SDK. Quickest install:
+   `winget install --id Microsoft.WindowsSDK.10.0.26100`. After installing,
+   re-source the MSVC env in a fresh PowerShell via:
+   ```powershell
+   . .\env\vsenv.ps1
+   ```
+   then run the eval as usual.
 
 Run from the repo root in PowerShell:
 
