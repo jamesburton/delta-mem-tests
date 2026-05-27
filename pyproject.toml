@@ -17,9 +17,17 @@ dependencies = [
     "psutil",
     # KV-cache quantization for the TurboQuant + delta-mem experiment.
     # Provides TurboQuantCache (DynamicCache subclass) with 3/4-bit quantization
-    # of K/V tensors plus a 128-token FP16 residual window. Used only when
-    # --turboquant-bits N is passed to run.locomo_eval.
+    # of K/V tensors plus a 128-token FP16 residual window. Used when
+    # --kv-cache-backend turboquant is passed to run.locomo_eval.
     "turboquant>=0.2.0",
+    # KIVI-style 2/4-bit KV-cache quantization backend used by
+    # transformers.cache_utils.QuantizedCache(backend="quanto"). Used when
+    # --kv-cache-backend quanto is passed.
+    "optimum-quanto>=0.2.5",
+    # optimum-quanto pulls torch.utils.cpp_extension which imports
+    # setuptools at module load time. Make the dep explicit so uv resolves
+    # it even though Python 3.12+ removed setuptools from the stdlib.
+    "setuptools",
 ]
 
 [project.optional-dependencies]

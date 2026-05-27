@@ -32,19 +32,37 @@ import deltamem.eval.locomo_delta as eval_mod
 from deltamem.core import reset_delta_mem_states
 from deltamem.runtime.session import DeltaMemChatSession
 
-# Optional KV-cache quantization via TurboQuant. Enabled by setting
-# TURBOQUANT_BITS env var to a positive integer (e.g. 4 or 3). When enabled:
-#   * the per-conversation KV-cache reuse path is bypassed because
-#     TurboQuantCache inherits crop() from DynamicCache but its quantized
-#     layers don't implement crop in a way that preserves correctness
-#   * each question's chunked prefill starts with a fresh TurboQuantCache
-#     so K/V are compressed to N bits in-flight; the last 128 tokens stay
-#     FP16 (TurboQuant's "residual window") so decoding precision matches
-#     the vendored path on recent positions
-# Set to 0 (or unset) to keep the existing bf16 + KV-cache-reuse path.
-TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "0"))
-TurboQuantCache = None
-if TURBOQUANT_BITS > 0:
+# Optional KV-cache quantization. Selected by two env vars:
+#   KV_CACHE_BACKEND ∈ {"bf16" (default), "turboquant", "quanto", "hqq"}
+#   KV_CACHE_BITS    ∈ int (backend-default if 0)
+#
+# When KV_CACHE_BACKEND != "bf16":
+#   * the per-conversation KV-cache reuse path is bypassed. Quantised cache
+#     classes either don't override Cache.crop() correctly (turboquant) or
+#     have residual+quantised-state interactions that aren't safe to crop
+#     into (quanto, hqq). Re-prefilling per question is slower but correct.
+#   * each fresh session is seeded with the requested quantised cache so
+#     K/V are compressed in-flight; recent-token residuals stay in original
+#     precision (128 tokens for turboquant, 128 for quanto/hqq via the
+#     `residual_length` arg).
+#
+# Backwards compat: TURBOQUANT_BITS=N (the prior single-knob interface) is
+# treated as `KV_CACHE_BACKEND=turboquant KV_CACHE_BITS=N`.
+_legacy_tq_bits = int(os.environ.get("TURBOQUANT_BITS", "0"))
+if _legacy_tq_bits > 0 and "KV_CACHE_BACKEND" not in os.environ:
+    os.environ["KV_CACHE_BACKEND"] = "turboquant"
+    os.environ.setdefault("KV_CACHE_BITS", str(_legacy_tq_bits))
+
+KV_CACHE_BACKEND = os.environ.get("KV_CACHE_BACKEND", "bf16").lower()
+KV_CACHE_BITS = int(os.environ.get("KV_CACHE_BITS", "0"))
+
+_VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq"}
+if KV_CACHE_BACKEND not in _VALID_BACKENDS:
+    raise ValueError(
+        f"KV_CACHE_BACKEND={KV_CACHE_BACKEND!r} not in {sorted(_VALID_BACKENDS)}"
+    )
+
+if KV_CACHE_BACKEND == "turboquant":
     # turboquant 0.2.0 calls np.trapz which was removed in numpy 2.0 (renamed
     # to np.trapezoid). Restore the alias before importing turboquant; this
     # is the minimal patch and is bit-identical to the original function.
@@ -52,6 +70,31 @@ if TURBOQUANT_BITS > 0:
     if not hasattr(_np, "trapz") and hasattr(_np, "trapezoid"):
         _np.trapz = _np.trapezoid
     from turboquant import TurboQuantCache  # noqa: F401
+elif KV_CACHE_BACKEND in ("quanto", "hqq"):
+    # transformers ships a KIVI-style QuantizedCache that wraps either the
+    # optimum-quanto or hqq backend. Quanto supports nbits ∈ {2, 4}; hqq
+    # supports {1, 2, 3, 4, 8}. We default to 2-bit when KV_CACHE_BITS is 0.
+    from transformers.cache_utils import QuantizedCache  # noqa: F401
+
+
+def _new_kv_cache(model):
+    """Construct a fresh KV cache per the env-var selection. Returns None
+    for the bf16 default, in which case the caller leaves
+    `session.past_key_values` unset and the model creates a DynamicCache.
+    """
+    if KV_CACHE_BACKEND == "bf16":
+        return None
+    if KV_CACHE_BACKEND == "turboquant":
+        bits = KV_CACHE_BITS if KV_CACHE_BITS > 0 else 4
+        return TurboQuantCache(bits=bits)
+    if KV_CACHE_BACKEND in ("quanto", "hqq"):
+        bits = KV_CACHE_BITS if KV_CACHE_BITS > 0 else 2
+        return QuantizedCache(
+            backend=KV_CACHE_BACKEND,
+            config=model.config,
+            nbits=bits,
+        )
+    raise AssertionError("unreachable")
 
 
 def _chunked_build_teacher_forced_snapshot(model, tokenizer, device, history):
@@ -382,12 +425,15 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    # When TurboQuant KV is active, force the fresh-prefill path. Cross-
-    # question cache reuse depends on Cache.crop(); TurboQuantCache's
-    # quantized layers don't preserve correctness under crop, so reusing
-    # a cropped cache would feed corrupted K/V to subsequent decode.
+    # When any KV quantisation backend is active, force the fresh-prefill
+    # path. Cross-question cache reuse depends on Cache.crop(); the
+    # quantised cache classes either don't preserve correctness under
+    # crop (TurboQuantCache's quantised layers) or have residual/quantised
+    # interactions that aren't safe to crop into (QuantizedCache with
+    # quanto/hqq backend). Falling back to fresh per-question prefill is
+    # slower but always correct.
     cache_hit_attempt = (
-        TURBOQUANT_BITS == 0 and not cache_entry.get("disabled", True)
+        KV_CACHE_BACKEND == "bf16" and not cache_entry.get("disabled", True)
     )
     if cache_hit_attempt:
         # Sanity check: the cached history must be a true prefix of this
@@ -411,14 +457,15 @@ def _chunked_official_full_history_answer(
     if not cache_hit_attempt:
         # Fallback: fresh chunked prefill from scratch (no cross-question
         # reuse). Matches the non-cached patch behaviour we previously
-        # validated. When TURBOQUANT_BITS > 0, seed the session with a
-        # fresh TurboQuantCache so that the entire chunked prefill plus
-        # the per-token decode forwards push K/V into the quantized cache.
+        # validated. When KV_CACHE_BACKEND != "bf16", seed the session
+        # with a fresh quantised cache so the entire chunked prefill plus
+        # per-token decode forwards push K/V through the chosen backend.
         reset_delta_mem_states(model)
         session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
         session.messages = [dict(m) for m in prompt_messages]
-        if TURBOQUANT_BITS > 0:
-            session.past_key_values = TurboQuantCache(bits=TURBOQUANT_BITS)
+        kv_cache = _new_kv_cache(model)
+        if kv_cache is not None:
+            session.past_key_values = kv_cache
         ingest_start = 0
     else:
         session = cache_entry["session"]
@@ -453,9 +500,14 @@ def _chunked_official_full_history_answer(
 
     if last_logits is None:
         raise RuntimeError("Empty official-prompt; cannot generate.")
-    tq_tag = f" tq{TURBOQUANT_BITS}" if TURBOQUANT_BITS > 0 else ""
+    if KV_CACHE_BACKEND == "bf16":
+        kv_tag = ""
+    elif KV_CACHE_BACKEND == "turboquant":
+        kv_tag = f" tq{KV_CACHE_BITS or 4}"
+    else:
+        kv_tag = f" {KV_CACHE_BACKEND}{KV_CACHE_BITS or 2}"
     print(
-        f"[official-prefill q{question_index} sample={sample['sample_id']}{tq_tag}] "
+        f"[official-prefill q{question_index} sample={sample['sample_id']}{kv_tag}] "
         f"suffix_chunks={chunk_idx} ingest_start={ingest_start} total={total} "
         f"final_chunk_ms={stats.get('elapsed_ms', '?')}",
         flush=True,

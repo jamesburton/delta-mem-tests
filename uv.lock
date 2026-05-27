@@ -295,9 +295,11 @@ dependencies = [
     { name = "einops" },
     { name = "huggingface-hub" },
     { name = "ninja" },
+    { name = "optimum-quanto" },
     { name = "peft" },
     { name = "psutil" },
     { name = "pydantic" },
+    { name = "setuptools" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -316,10 +318,12 @@ requires-dist = [
     { name = "einops" },
     { name = "huggingface-hub" },
     { name = "ninja" },
+    { name = "optimum-quanto", specifier = ">=0.2.5" },
     { name = "peft" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "setuptools" },
     { name = "torch", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -948,6 +952,23 @@ version = "12.1.105"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/da/d3/8057f0587683ed2fcd4dbfbdfdfa807b9160b809976099d36b8f60d08f03/nvidia_nvtx_cu12-12.1.105-py3-none-manylinux1_x86_64.whl", hash = "sha256:dc21cf308ca5691e7c04d962e213f8a4aa9bbfa23d95412f452254c2caeb09e5", size = 99138, upload-time = "2023-04-19T15:48:43.556Z" },
+]
+
+[[package]]
+name = "optimum-quanto"
+version = "0.2.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "ninja" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "safetensors" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/16/a9/5d9b8c3c6bd7264f8ca03c54921d7f4beda5fb2a682d947abd1d524a71ec/optimum_quanto-0.2.6.tar.gz", hash = "sha256:da9a3093a92102f11c3bd7794d566b3a9d7c100962f41800b3e9b330d0bdfb5e", size = 361281, upload-time = "2024-10-29T17:13:31.921Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/76/142ddfc54fe9d12ae75fa82f96d0701ecdafcc1961e2c9003e4d334894d8/optimum_quanto-0.2.6-py3-none-any.whl", hash = "sha256:5b0d41757f982c7c70f8ec23bb843c7eb0e6fe3fd99d5e35d70003df2a6ee11f", size = 165113, upload-time = "2024-10-29T17:13:40.614Z" },
 ]
 
 [[package]]

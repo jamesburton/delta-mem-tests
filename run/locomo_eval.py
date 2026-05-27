@@ -141,7 +141,8 @@ def _invoke_vendored_eval(
     max_conversations: Optional[int] = None,
     max_questions_per_conversation: Optional[int] = None,
     data_file: Optional[str] = None,
-    turboquant_bits: int = 0,
+    kv_cache_backend: str = "bf16",
+    kv_cache_bits: int = 0,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -179,9 +180,15 @@ def _invoke_vendored_eval(
     log_path = RAW_DIR / "locomo-stdout.log"
     print(f"Running: {' '.join(cmd)}")
     subprocess_env = {**os.environ, "DELTA_MEM_SCAN_IMPL": "torch"}
-    if turboquant_bits > 0:
-        subprocess_env["TURBOQUANT_BITS"] = str(turboquant_bits)
-        print(f"  TURBOQUANT_BITS={turboquant_bits} (KV cache quantised; cross-question cache reuse disabled)")
+    if kv_cache_backend != "bf16":
+        subprocess_env["KV_CACHE_BACKEND"] = kv_cache_backend
+        if kv_cache_bits > 0:
+            subprocess_env["KV_CACHE_BITS"] = str(kv_cache_bits)
+        print(
+            f"  KV_CACHE_BACKEND={kv_cache_backend} "
+            f"KV_CACHE_BITS={kv_cache_bits or '(backend-default)'} "
+            "(KV cache quantised; cross-question cache reuse disabled)"
+        )
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(
             cmd,
@@ -276,15 +283,37 @@ def main() -> int:
              "relative to repo root). Use to run on a custom subset.",
     )
     parser.add_argument(
+        "--kv-cache-backend",
+        choices=["bf16", "turboquant", "quanto", "hqq"],
+        default="bf16",
+        help="KV-cache quantisation backend. `bf16` (default) keeps the bf16 "
+             "DynamicCache plus our per-conversation crop+reuse trick. "
+             "`turboquant` uses turboquant>=0.2.0 (TurboQuantCache, 4-bit "
+             "default; pure-Python codebook is slow). `quanto`/`hqq` use "
+             "transformers' built-in KIVI-style QuantizedCache "
+             "(quanto supports 2/4-bit; hqq supports 1/2/3/4/8-bit). "
+             "Any non-bf16 backend disables cross-question KV-cache reuse.",
+    )
+    parser.add_argument(
+        "--kv-cache-bits",
+        type=int,
+        default=0,
+        help="Bit-width for the quantisation backend (0 = backend default: "
+             "turboquant->4, quanto/hqq->2).",
+    )
+    parser.add_argument(
         "--turboquant-bits",
         type=int,
         default=0,
-        help="If > 0, quantise the KV cache to this bit-width via TurboQuant "
-             "(4 = 4-bit; 3 = 3-bit). Disables cross-question KV-cache reuse "
-             "(TurboQuantCache.crop is unsafe on quantised layers). Pass 0 "
-             "to keep bf16 KV with cache reuse (default).",
+        help="(Deprecated) Backwards-compat for --kv-cache-backend turboquant "
+             "--kv-cache-bits N. If > 0, equivalent to those flags.",
     )
     args = parser.parse_args()
+    # Backwards compat: --turboquant-bits implies --kv-cache-backend turboquant.
+    if args.turboquant_bits > 0 and args.kv_cache_backend == "bf16":
+        args.kv_cache_backend = "turboquant"
+        if args.kv_cache_bits == 0:
+            args.kv_cache_bits = args.turboquant_bits
 
     output_json = Path(args.output_json)
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -310,14 +339,19 @@ def main() -> int:
         max_conversations=args.max_conversations,
         max_questions_per_conversation=args.max_questions_per_conversation,
         data_file=args.data_file,
-        turboquant_bits=args.turboquant_bits,
+        kv_cache_backend=args.kv_cache_backend,
+        kv_cache_bits=args.kv_cache_bits,
     )
 
-    if args.turboquant_bits > 0:
-        EVAL_CONFIG["turboquant_bits"] = args.turboquant_bits
+    if args.kv_cache_backend != "bf16":
+        EVAL_CONFIG["kv_cache_backend"] = args.kv_cache_backend
+        EVAL_CONFIG["kv_cache_bits"] = args.kv_cache_bits or (
+            4 if args.kv_cache_backend == "turboquant" else 2
+        )
         EVAL_CONFIG["kv_cache"] = (
-            f"TurboQuant {args.turboquant_bits}-bit "
-            "(residual-window 128 tokens FP16; cross-question reuse disabled)"
+            f"{args.kv_cache_backend} {EVAL_CONFIG['kv_cache_bits']}-bit "
+            "(residual-window kept in original precision; "
+            "cross-question reuse disabled)"
         )
     dm, fz, skipped = _extract_ratios(scores_path)
 
