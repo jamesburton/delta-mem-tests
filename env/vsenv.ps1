@@ -32,3 +32,16 @@ if ($cl) {
 } else {
     Write-Error "Sourced vcvars64.bat but cl.exe still not on PATH. Investigate."
 }
+
+# CUDA 13.x's host_config.h rejects VS 2025 (only VS 2019-2022 are on its allow
+# list) but the compiler itself works fine for our use case. Inject the official
+# escape hatch via NVCC_PREPEND_FLAGS so every nvcc invocation in this shell
+# session gets -allow-unsupported-compiler. Used by torch.cpp_extension's JIT
+# build path (optimum-quanto, deltamem.kernels, etc.).
+if (-not $env:NVCC_PREPEND_FLAGS) {
+    $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
+    Write-Host "Set NVCC_PREPEND_FLAGS=-allow-unsupported-compiler (CUDA<->VS version check bypass)"
+} elseif ($env:NVCC_PREPEND_FLAGS -notmatch "allow-unsupported-compiler") {
+    $env:NVCC_PREPEND_FLAGS = "$($env:NVCC_PREPEND_FLAGS) -allow-unsupported-compiler"
+    Write-Host "Appended -allow-unsupported-compiler to existing NVCC_PREPEND_FLAGS"
+}

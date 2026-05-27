@@ -22,8 +22,17 @@ dependencies = [
     "turboquant>=0.2.0",
     # KIVI-style 2/4-bit KV-cache quantization backend used by
     # transformers.cache_utils.QuantizedCache(backend="quanto"). Used when
-    # --kv-cache-backend quanto is passed.
+    # --kv-cache-backend quanto is passed. NOTE: on Windows optimum-quanto's
+    # JIT-compiled CUDA kernels (gemm_cuda.cu) use GCC-style __asm__ inline
+    # assembly that MSVC can't parse — quanto is effectively Linux-only at
+    # this version. Listed for completeness but expect failure on Windows;
+    # use hqq backend instead.
     "optimum-quanto>=0.2.5",
+    # 1-8 bit KV-cache quantization backend used by
+    # transformers.cache_utils.QuantizedCache(backend="hqq"). Ships
+    # pre-built CUDA kernels via the hqq package, so no JIT compile on
+    # the host. Used when --kv-cache-backend hqq is passed.
+    "hqq>=0.2.0",
     # optimum-quanto pulls torch.utils.cpp_extension which imports
     # setuptools at module load time. Make the dep explicit so uv resolves
     # it even though Python 3.12+ removed setuptools from the stdlib.

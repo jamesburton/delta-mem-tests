@@ -13,8 +13,12 @@ Prerequisites on native Windows 11:
    the first time it dequantises). Tick the "Windows 11 SDK" individual
    component too — vcvars64.bat puts `cl.exe` on PATH but won't find the
    C runtime headers (`stddef.h` etc.) without the SDK. Quickest install:
-   `winget install --id Microsoft.WindowsSDK.10.0.26100`. After installing,
-   re-source the MSVC env in a fresh PowerShell via:
+   `winget install --id Microsoft.WindowsSDK.10.0.26100`.
+
+   **CUDA 13.x + VS 2025 caveat:** CUDA 13.x's `host_config.h` only allows
+   VS 2019–2022; with VS 2025 Build Tools, NVCC errors out unless given
+   `-allow-unsupported-compiler`. `env/vsenv.ps1` injects this via
+   `NVCC_PREPEND_FLAGS`. Re-source the MSVC env in a fresh PowerShell via:
    ```powershell
    . .\env\vsenv.ps1
    ```
