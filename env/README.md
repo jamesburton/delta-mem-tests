@@ -37,6 +37,31 @@ default CPU torch with `torch==2.5.1+cu121`, and registers the vendored
 The sanity output should report `cuda=True`, the RTX 3060, and
 `deltamem importable: True`.
 
+## KV-cache backends
+
+The chunked eval runner selects between several KV-cache implementations via
+`KV_CACHE_BACKEND`:
+
+| Backend      | `KV_CACHE_BITS` default | Extra env vars                              |
+|--------------|------------------------:|---------------------------------------------|
+| `bf16`       | (n/a)                   | none — model creates a `DynamicCache`       |
+| `turboquant` | 4                       | none                                        |
+| `quanto`     | 2                       | none (broken on Windows; see above)         |
+| `hqq`        | 2                       | none                                        |
+| `oscar`      | 2                       | `OSCAR_K_ROTATION_PATH`, `OSCAR_V_ROTATION_PATH` (required); `OSCAR_SINK_TOKENS` (=64), `OSCAR_RECENT_TOKENS` (=256), `OSCAR_K_CLIP` (=0.96), `OSCAR_V_CLIP` (=0.92), `OSCAR_GROUP_SIZE` (=128) (optional, defaults match RotationZoo) |
+
+The OSCAR backend is implemented in the sibling package
+`third_party/oscar-transformers` (git submodule). It pre-bakes rotation
+matrices into the model's Q/K/V/O projections on first cache construction —
+this mutates the in-memory model permanently for the process, so do not mix
+`oscar` runs with other backends in the same Python session.
+
+Download rotations from
+[huggingface.co/Zhongzhu/OSCAR-RotationZoo](https://huggingface.co/Zhongzhu/OSCAR-RotationZoo).
+We use the `Qwen3-4B-Thinking-2507` rotations on `Qwen3-4B-Instruct-2507` as a
+first-pass transfer test before running our own calibration; see
+`report/tier1-summary.md` Appendix C for why this stage is necessary at all.
+
 ## Why not `pip install -e ./delta-Mem`?
 
 The vendored `delta-Mem` repo has no `pyproject.toml`/`setup.py` of its own.

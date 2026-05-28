@@ -1,3 +1,6 @@
 [submodule "delta-Mem"]
 	path = delta-Mem
 	url = https://github.com/declare-lab/delta-Mem.git
+[submodule "third_party/oscar-transformers"]
+	path = third_party/oscar-transformers
+	url = https://github.com/jamesburton/oscar-transformers.git

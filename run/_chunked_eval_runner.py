@@ -56,7 +56,7 @@ if _legacy_tq_bits > 0 and "KV_CACHE_BACKEND" not in os.environ:
 KV_CACHE_BACKEND = os.environ.get("KV_CACHE_BACKEND", "bf16").lower()
 KV_CACHE_BITS = int(os.environ.get("KV_CACHE_BITS", "0"))
 
-_VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq"}
+_VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq", "oscar"}
 if KV_CACHE_BACKEND not in _VALID_BACKENDS:
     raise ValueError(
         f"KV_CACHE_BACKEND={KV_CACHE_BACKEND!r} not in {sorted(_VALID_BACKENDS)}"
@@ -75,6 +75,45 @@ elif KV_CACHE_BACKEND in ("quanto", "hqq"):
     # optimum-quanto or hqq backend. Quanto supports nbits ∈ {2, 4}; hqq
     # supports {1, 2, 3, 4, 8}. We default to 2-bit when KV_CACHE_BITS is 0.
     from transformers.cache_utils import QuantizedCache  # noqa: F401
+elif KV_CACHE_BACKEND == "oscar":
+    # OSCAR rotates Q/K/V/O projections into a basis that flattens per-channel
+    # outliers, then quantizes K and V to per-token group-128 asymmetric INT2
+    # in the rotated basis. The rotation is mathematically a no-op end-to-end
+    # (orthogonal) but the rotated tensor distribution is friendly to INT2
+    # quantization where the naive basis collapses to gibberish (Appendix C of
+    # report/tier1-summary.md).
+    #
+    # Required env vars:
+    #   OSCAR_K_ROTATION_PATH — path to k_rotation_qqt_r_h_pbr.pt
+    #   OSCAR_V_ROTATION_PATH — path to v_rotation_sst_r_h_pbr.pt
+    # Optional knobs (matched to RotationZoo / sglang defaults):
+    #   OSCAR_SINK_TOKENS   (default 64)
+    #   OSCAR_RECENT_TOKENS (default 256)
+    #   OSCAR_K_CLIP        (default 0.96)
+    #   OSCAR_V_CLIP        (default 0.92)
+    #   OSCAR_GROUP_SIZE    (default 128)
+    from oscar_transformers import (  # noqa: F401
+        OSCARCache,
+        bake_rotations,
+        load_rotation_file,
+    )
+
+    _OSCAR_K_PATH = os.environ.get("OSCAR_K_ROTATION_PATH")
+    _OSCAR_V_PATH = os.environ.get("OSCAR_V_ROTATION_PATH")
+    if not _OSCAR_K_PATH or not _OSCAR_V_PATH:
+        raise EnvironmentError(
+            "KV_CACHE_BACKEND=oscar requires OSCAR_K_ROTATION_PATH and "
+            "OSCAR_V_ROTATION_PATH to point at the per-K and per-V rotation "
+            ".pt files (download from huggingface.co/Zhongzhu/OSCAR-RotationZoo)."
+        )
+    _OSCAR_SINK = int(os.environ.get("OSCAR_SINK_TOKENS", "64"))
+    _OSCAR_RECENT = int(os.environ.get("OSCAR_RECENT_TOKENS", "256"))
+    _OSCAR_K_CLIP = float(os.environ.get("OSCAR_K_CLIP", "0.96"))
+    _OSCAR_V_CLIP = float(os.environ.get("OSCAR_V_CLIP", "0.92"))
+    _OSCAR_GROUP = int(os.environ.get("OSCAR_GROUP_SIZE", "128"))
+
+
+_OSCAR_ROTATIONS_BAKED = False
 
 
 def _new_kv_cache(model):
@@ -82,6 +121,7 @@ def _new_kv_cache(model):
     for the bf16 default, in which case the caller leaves
     `session.past_key_values` unset and the model creates a DynamicCache.
     """
+    global _OSCAR_ROTATIONS_BAKED
     if KV_CACHE_BACKEND == "bf16":
         return None
     if KV_CACHE_BACKEND == "turboquant":
@@ -93,6 +133,33 @@ def _new_kv_cache(model):
             backend=KV_CACHE_BACKEND,
             config=model.config,
             nbits=bits,
+        )
+    if KV_CACHE_BACKEND == "oscar":
+        if not _OSCAR_ROTATIONS_BAKED:
+            # Bake exactly once per process. bake_rotations is not idempotent;
+            # applying it twice would compose the rotation with itself and
+            # silently produce wrong outputs. The module-level flag is the
+            # single source of truth.
+            k_rot = load_rotation_file(_OSCAR_K_PATH)
+            v_rot = load_rotation_file(_OSCAR_V_PATH)
+            print(
+                f"[oscar] baking rotations from k={_OSCAR_K_PATH} "
+                f"v={_OSCAR_V_PATH} (objectives k='{k_rot.objective}' "
+                f"v='{v_rot.objective}' head_dim={k_rot.head_dim} "
+                f"layers={len(k_rot)})",
+                flush=True,
+            )
+            bake_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
+            _OSCAR_ROTATIONS_BAKED = True
+        bits = KV_CACHE_BITS if KV_CACHE_BITS > 0 else 2
+        return OSCARCache(
+            config=model.config,
+            sink_tokens=_OSCAR_SINK,
+            recent_tokens=_OSCAR_RECENT,
+            bits=bits,
+            group_size=_OSCAR_GROUP,
+            k_clip=_OSCAR_K_CLIP,
+            v_clip=_OSCAR_V_CLIP,
         )
     raise AssertionError("unreachable")
 
