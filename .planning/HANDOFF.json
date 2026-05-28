@@ -1,0 +1,55 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-28T08:24:00Z",
+  "context": "research",
+  "project": "delta-mem-tests",
+  "status": "paused",
+  "last_commit": "1d63ed8",
+  "current_milestone": "Tier 1 reproduction + KV-quantisation x delta-mem experiment ladder",
+  "what_we_proved": [
+    {"experiment": "bf16 baseline (conv-0 full + conv-1+8)", "result": "ratio 0.99x weighted across 389 q vs paper 1.20x", "verdict": "OUT_OF_BAND/REGRESSION; likely adapter mismatch (paper used QASPER-trained SSW/TSW/MSW, we used public HF declare-lab adapter)"},
+    {"experiment": "delta-only (conv-0, 152 q)", "result": "delta_only 0.1064 vs truncated_base 0.0591 = 1.80x lift; temporal questions 20x lift", "verdict": "delta-mem captures real compressed memory; ~30% of full-attention quality"},
+    {"experiment": "TurboQuant 4-bit (conv-0, 10 q)", "result": "base 0.3344 / delta 0.3342 vs bf16 0.2680/0.2680 same slice", "verdict": "quality preserved at 4-bit; ~73% memory saving; pure-python codebook is ~50 min/q vs bf16's 5 min/q"},
+    {"experiment": "HQQ 2-bit (conv-0, 10 q)", "result": "all scores 0.0000, outputs gibberish", "verdict": "naive 2-bit destroys attention; empirically validates need for OSCAR's spectral-rotation preconditioning"}
+  ],
+  "infrastructure_state": {
+    "repo": "E:\\Development\\delta-mem-tests (git, main branch, clean)",
+    "vendored_submodule": "delta-Mem at pinned commit 98dc679572ef77d77b97485bf2f2b2aa810b74ba (unmodified on disk)",
+    "venv": ".venv via uv; CUDA 12.1 torch 2.5.1; turboquant 0.2.0 + hqq 0.2.8.post1 + optimum-quanto 0.2.5 installed",
+    "windows_quirks": "MSVC env via env/vsenv.ps1; CUDA 13.1 needs -allow-unsupported-compiler for VS 2025; optimum-quanto is Linux-only (gemm_cuda.cu uses GCC __asm__)",
+    "hardware": "Native Windows 11, internal RTX 3060 12 GB (T5500 workstation)"
+  },
+  "in_process_patches": [
+    "_chunked_eval_runner.py: chunked-prefill of build_teacher_forced_snapshot (history_replay mode, inert in official_prompt)",
+    "_chunked_eval_runner.py: OOM-class normalisation wrapping _generate_prompt_chunk (inert in official_prompt)",
+    "_chunked_eval_runner.py: chunked prefill of generate_official_full_history_answer (replaces monolithic 17.6k-token model.generate that OOMs at 37 GB)",
+    "_chunked_eval_runner.py: per-conversation KV-cache reuse via Cache.crop(history_len) — disabled when KV_CACHE_BACKEND != bf16",
+    "_chunked_eval_runner.py: KV_CACHE_BACKEND env var (bf16|turboquant|quanto|hqq) + KV_CACHE_BITS"
+  ],
+  "next_planned_experiment": {
+    "name": "OSCAR 2-bit KV in HF transformers (no SGLang)",
+    "rationale": "HQQ-2bit unusable; TQ-4bit too slow; OSCAR's spectral-rotation should make 2-bit viable. Pair with delta-mem.",
+    "scope": "Port OSCAR's rotation + INT2 per-token asymmetric quantization (group size 64; sink + recent tokens kept FP16) from sglang-research into a transformers.cache_utils.Cache subclass. Then compute Qwen3-4B-Instruct-2507 rotations (3-phase: dump Q/K/V -> fit -> eval; OSCAR's RotationZoo on HF has Thinking variant but not Instruct). Re-run conv-0/10q against bf16+delta and TQ4+delta baselines.",
+    "deliverable_repo": "user wants this as a new public repo (eg oscar-transformers); track here as a git submodule",
+    "implementation_path": "1) PyTorch reference implementation (slow, correct). 2) Optimise with Triton or CUDA kernels — candidate for AutoKernel-driven generation.",
+    "future_steps": ["MTP (multi-token prediction) once OSCAR + delta-mem combo proven", "Deployment in dotLLM or other servers (not transformers)"]
+  },
+  "blockers": [
+    {"description": "OSCAR ships only as SGLang patches, not a transformers library. Port required.", "type": "engineering", "workaround": "Port the rotation+quantize math into a transformers.Cache subclass"},
+    {"description": "RotationZoo on HF has Qwen3-4B-Thinking-2507 but not Qwen3-4B-Instruct-2507. We use the Instruct variant.", "type": "data", "workaround": "Run the 3-phase rotation calibration ourselves on the Instruct model. Costs hours of GPU."},
+    {"description": "optimum-quanto's CUDA extension uses GCC __asm__ inline assembly; doesn't compile on MSVC.", "type": "technical", "workaround": "Skip optimum-quanto on Windows; use hqq for the HF QuantizedCache path. Documented in env/README.md."}
+  ],
+  "human_actions_pending": [
+    {"action": "Decide: stop with Tier 1 closed + OSCAR-port plan documented, or start the OSCAR port now in this repo before spinning out to a sub-repo", "context": "Last user question before pause", "blocking": false}
+  ],
+  "decisions_made": [
+    {"decision": "Switch from --full-history-mode history_replay (default) to official_prompt", "rationale": "history_replay produced bit-identical predictions on small samples; official_prompt is the paper's protocol"},
+    {"decision": "Chunked prefill the official prompt + KV-cache reuse across questions", "rationale": "Vendored monolithic 17.6k-token model.generate OOMs at 37 GB SDPA scratch on 12 GB card"},
+    {"decision": "Used HF declare-lab/delta-mem_qwen3_4b-instruct adapter (not the SSW/TSW/MSW QASPER-trained variants the official benchmark suite references)", "rationale": "QASPER-trained checkpoints are at internal /root/models/ paths, not published"},
+    {"decision": "Pivoted 2-bit experiment from quanto to hqq backend", "rationale": "optimum-quanto's gemm_cuda.cu doesn't compile on Windows MSVC; hqq ships pre-built kernels"},
+    {"decision": "Next experiment is OSCAR port to transformers Cache subclass, NOT full SGLang integration", "rationale": "SGLang integration would require porting delta-mem (which is an HF attention-replacement adapter) into SGLang's CUDA kernels — multi-week project blocked on bigger hardware. Porting OSCAR math to HF is the cheaper move."}
+  ],
+  "uncommitted_files": [],
+  "next_action": "If continuing OSCAR port: (1) create a new public repo (suggested: oscar-transformers). (2) Add as submodule under e.g. third_party/oscar-transformers. (3) Read delta-Mem-tests/notes/ for the integration touchpoints; design TurboQuantCache-like API: from oscar_transformers import OSCARCache; cache = OSCARCache(rotation_path=..., bits=2). (4) Step 1 of porting: pull the rotation matrices from RotationZoo (Qwen3-4B-Thinking-2507) and trial them on Qwen3-4B-Instruct-2507 — if they work approximately, we save the 3-phase calibration. (5) If not, run sglang-research's dump/fit pipeline on Instruct.",
+  "context_notes": "We followed the user's plan exactly: prove 2-bit + delta-mem fits before porting OSCAR. HQQ shows 2-bit naive doesn't work, which is the strongest empirical case for OSCAR's rotation step. The summary in report/tier1-summary.md (Appendices A, B, C) captures the full story. Context budget on the assistant got low (65%+) which is why we paused — pick up in a fresh session for the OSCAR port itself."
+}
