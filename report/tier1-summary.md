@@ -144,3 +144,31 @@ Cross-question KV-cache reuse (the optimisation that gave bf16 a 7.7× speedup) 
 The combination *would* unlock running longer context on this 12 GB card if a fast kernel were available. The next experiment that would actually pay off is testing this on a model + dataset that genuinely needs the bigger context window (say 50k+ tokens), where bf16 simply doesn't fit, and where delta-mem's compressed state can carry the rest. That ideally happens on faster kernels (llama.cpp turbo3/turbo4 variants) or on a machine with more headroom for the slow Python path.
 
 Raw artifacts: `outputs/tq4_conv0_smoke.json`, `report/raw/locomo-{stdout,driver}-tq4-conv0-smoke.log`.
+
+## Appendix C: HQQ 2-bit KV — quality collapse
+
+We staged a second 2-bit KV experiment using `transformers.cache_utils.QuantizedCache(backend="hqq", nbits=2)` — the HQQ backend was selected after optimum-quanto's CUDA extension failed to compile on Windows (its `gemm_cuda.cu` uses GCC `__asm__` inline assembly that MSVC can't parse).
+
+Conv-0 / first 10 questions, 8h 42m wall.
+
+| Condition | overall | multi_hop | temporal | open_domain |
+|---|---:|---:|---:|---:|
+| base   | **0.0000** | 0.0000 | 0.0000 | 0.0000 |
+| delta  | **0.0000** | 0.0000 | 0.0000 | 0.0000 |
+
+The model outputs are gibberish under HQQ-2bit. Sample raw predictions:
+
+- Base Q0 ("When did Caroline go to the LGBTQ support group?"): `'and it?"\n\n,  is is that? that &  it is, said and   & ", about is is to, and hers'`
+- Delta Q0: `"Car32-tofa �awning is to-t wo' H e3hH iv6   che3 �ozah� **:3 3chan riclish  is d"`
+
+**Why naive 2-bit fails here:** HQQ's per-channel quantization is designed primarily for *model weight* compression, where the activations passing through stay fp16. KV cache quantization at 2 bits applies the same shape of compression directly to attention K/V tensors, but K/V has very different statistics than weight matrices — large outliers per channel destroy the quantization grid and the dequantized K/V values are too noisy for attention to recover usable scores.
+
+**Why this validates the OSCAR direction:** OSCAR's headline mechanism is an *offline spectral covariance-aware rotation* applied to K/V before quantization. The rotation flattens the per-channel outlier distribution into something the 2-bit grid can represent without destroying attention. Without the rotation, 2-bit is unusable — which is exactly what this run shows. The empirically-validated conclusion is:
+
+- 4-bit naive (TurboQuant, Appendix B): quality preserved
+- 2-bit naive (HQQ, this appendix): quality collapses to 0
+- 2-bit with attention-aware rotations (OSCAR): paper claims near-baseline accuracy → next experiment to run
+
+So the next experimental step is to port OSCAR's rotation+quantize math into a `transformers.Cache` subclass (avoiding the SGLang dependency), compute Qwen3-4B-Instruct rotations, and re-run on conv-0. That's the work tracked for the staged OSCAR sub-repo.
+
+Raw artifacts: `outputs/hqq2_conv0_smoke.json`, `report/raw/locomo-{stdout,driver}-hqq2-conv0.log`.

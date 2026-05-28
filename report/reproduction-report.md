@@ -14,19 +14,19 @@ Three in-process monkeypatches applied in `run/_chunked_eval_runner.py`. All are
   Numerical note: chunked + cached prefill is equivalent to monolithic prefill in the infinite-precision limit. In bf16, GEMM kernel selection at different chunk sizes can perturb long-form sampled outputs by a few tokens; per-question score and overall ratio agree to the reported precision on the validation slice we checked.
 
 See the "Eval config" section below for `methodology_adjustment` and related keys recorded with this run.
-**Verdict:** REGRESSION
+**Verdict:** OUT_OF_BAND
 
 ## Headline
 
-- Our delta-mem-vs-frozen-backbone ratio: **1.00×**
+- Our delta-mem-vs-frozen-backbone ratio: **nan×**
 - Paper's reported ratio: **1.20×**
 - Tolerance band: **±0.05**
-- Deviation from paper: **0.20**
+- Deviation from paper: **nan**
 
 ## Scores
 
-- delta-mem score: **0.3342**
-- frozen backbone score: **0.3344**
+- delta-mem score: **0.0000**
+- frozen backbone score: **0.0000**
 
 ## Run metadata
 
@@ -44,8 +44,9 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 - `full_history_mode`: `official_prompt`
 - `eval_batch_size`: `2`
 - `methodology_adjustment`: `Three in-process monkeypatches on the vendored eval, all required to fit Tier 1 reproduction on a 12 GB card: (1) --full-history-mode=official_prompt is the paper's protocol (matches scripts/run_qasper_multimodel_*); (2) generate_official_full_history_answer is replaced with a DeltaMemChatSession chunked prefill (~1k-token chunks via _ingest_full_ids prefix-skip) because the vendored monolithic model.generate hits SDPA MATH backend on a 17.6k-token prompt and tries to allocate ~37 GB; (3) per-conversation KV-cache reuse — the history portion is prefilled once per conversation, snapshotted (KV cache + delta-mem state), then restored and Cache.crop()-truncated to history_len before each subsequent question so _ingest_full_ids only forwards the ~50-token question suffix. Mathematically equivalent in the infinite-precision limit (autoregressive attention depends only on prior tokens via the KV cache); in bf16 the chunk-boundary GEMM kernel selection can perturb long-form outputs by a few sampled tokens, but per-question scores and overall ratio agree to the reported precision on the validation set (1 conv x 3 q). The build_teacher_forced_snapshot chunked patch and _generate_prompt_chunk OOM-class normalisation are kept in the runner but inert in official_prompt mode.`
-- `turboquant_bits`: `4`
-- `kv_cache`: `TurboQuant 4-bit (residual-window 128 tokens FP16; cross-question reuse disabled)`
+- `kv_cache_backend`: `hqq`
+- `kv_cache_bits`: `2`
+- `kv_cache`: `hqq 2-bit (residual-window kept in original precision; cross-question reuse disabled)`
 
 ## Asterisks
 
@@ -53,4 +54,4 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Investigation note
 
-Our ratio of 1.00 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
+Our ratio differs from the paper by nan, which exceeds the ±0.05 tolerance. Per the spec, this is a finding to investigate, not to smooth over. See the raw outputs under `report/raw/` for the per-sample breakdown.
