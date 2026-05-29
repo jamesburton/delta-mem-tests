@@ -94,7 +94,7 @@ elif KV_CACHE_BACKEND == "oscar":
     #   OSCAR_GROUP_SIZE    (default 128)
     from oscar_transformers import (  # noqa: F401
         OSCARCache,
-        bake_rotations,
+        apply_rotations,
         load_rotation_file,
     )
 
@@ -136,20 +136,20 @@ def _new_kv_cache(model):
         )
     if KV_CACHE_BACKEND == "oscar":
         if not _OSCAR_ROTATIONS_BAKED:
-            # Bake exactly once per process. bake_rotations is not idempotent;
-            # applying it twice would compose the rotation with itself and
-            # silently produce wrong outputs. The module-level flag is the
-            # single source of truth.
+            # Wire exactly once per process. apply_rotations is idempotent in
+            # principle (overwrites the buffers, no-ops the class patch) but
+            # we still gate on the flag to avoid the extra .pt load and the
+            # log spam.
             k_rot = load_rotation_file(_OSCAR_K_PATH)
             v_rot = load_rotation_file(_OSCAR_V_PATH)
             print(
-                f"[oscar] baking rotations from k={_OSCAR_K_PATH} "
+                f"[oscar] applying rotations from k={_OSCAR_K_PATH} "
                 f"v={_OSCAR_V_PATH} (objectives k='{k_rot.objective}' "
                 f"v='{v_rot.objective}' head_dim={k_rot.head_dim} "
                 f"layers={len(k_rot)})",
                 flush=True,
             )
-            bake_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
+            apply_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
             _OSCAR_ROTATIONS_BAKED = True
         bits = KV_CACHE_BITS if KV_CACHE_BITS > 0 else 2
         return OSCARCache(
