@@ -284,7 +284,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--kv-cache-backend",
-        choices=["bf16", "turboquant", "quanto", "hqq"],
+        choices=["bf16", "turboquant", "quanto", "hqq", "oscar"],
         default="bf16",
         help="KV-cache quantisation backend. `bf16` (default) keeps the bf16 "
              "DynamicCache plus our per-conversation crop+reuse trick. "
@@ -292,6 +292,9 @@ def main() -> int:
              "default; pure-Python codebook is slow). `quanto`/`hqq` use "
              "transformers' built-in KIVI-style QuantizedCache "
              "(quanto supports 2/4-bit; hqq supports 1/2/3/4/8-bit). "
+             "`oscar` uses the vendored oscar-transformers port: per-layer "
+             "orthogonal Q/K/V rotation + sink/recent/INT2-middle cache; "
+             "requires OSCAR_K_ROTATION_PATH and OSCAR_V_ROTATION_PATH env vars. "
              "Any non-bf16 backend disables cross-question KV-cache reuse.",
     )
     parser.add_argument(
