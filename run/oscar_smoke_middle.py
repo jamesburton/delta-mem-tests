@@ -36,6 +36,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -48,9 +49,18 @@ from oscar_transformers import OSCARCache, apply_rotations, load_rotation_file
 
 
 MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
-ROT_DIR = Path("data/oscar/rotations/_hf_cache/Qwen3-4B-Thinking-2507/seq20000_prompt83_group128")
-K_PATH = ROT_DIR / "k_rotation_qqt_r_h_pbr.pt"
-V_PATH = ROT_DIR / "v_rotation_sst_r_h_pbr.pt"
+# Default to the original RotationZoo Thinking-2507 path; override with
+# OSCAR_K_ROTATION_PATH / OSCAR_V_ROTATION_PATH to point at locally calibrated
+# rotations (e.g. data/oscar/rotations/instruct_gpqa or instruct_locomo).
+_DEFAULT_ROT_DIR = Path("data/oscar/rotations/_hf_cache/Qwen3-4B-Thinking-2507/seq20000_prompt83_group128")
+K_PATH = Path(os.environ.get(
+    "OSCAR_K_ROTATION_PATH",
+    str(_DEFAULT_ROT_DIR / "k_rotation_qqt_r_h_pbr.pt"),
+))
+V_PATH = Path(os.environ.get(
+    "OSCAR_V_ROTATION_PATH",
+    str(_DEFAULT_ROT_DIR / "v_rotation_sst_r_h_pbr.pt"),
+))
 
 MAX_NEW = 80
 # 4k prompt fits monolithic SDPA on a 12 GB card; the LoCoMo eval uses chunked
@@ -231,7 +241,7 @@ def main() -> int:
     })
 
     # ----- Wire OSCAR rotations once; vary sink/recent across runs -----
-    print("\nloading rotations and applying to model ...", flush=True)
+    print(f"\nloading rotations:\n  K: {K_PATH}\n  V: {V_PATH}", flush=True)
     k_rot = load_rotation_file(K_PATH)
     v_rot = load_rotation_file(V_PATH)
     apply_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
