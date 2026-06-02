@@ -433,6 +433,16 @@ def _ensure_conversation_cache(model, tokenizer, device, sample, *, seed, answer
     reset_delta_mem_states(model)
     session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
 
+    # For non-bf16 backends, seed a backend-specific cache so the history
+    # prefill flows through the same quantization the per-question prefill
+    # would use. Required for OSCAR (otherwise the snapshot we capture
+    # below would be a DynamicCache that the OSCAR-mode questions can't
+    # consume); harmless for any backend whose cache supports snapshot.
+    if KV_CACHE_BACKEND != "bf16":
+        seed_cache = _new_kv_cache(model)
+        if seed_cache is not None:
+            session.past_key_values = seed_cache
+
     # Chunked-ingest the history-only prefix so the session's past_kv ends
     # at exactly history_len tokens. Subsequent questions then add only their
     # question-specific suffix via _ingest_full_ids' prefix-skip.
@@ -454,12 +464,20 @@ def _ensure_conversation_cache(model, tokenizer, device, sample, *, seed, answer
         flush=True,
     )
 
+    # Snapshot the cache state at the history checkpoint. For OSCAR this is
+    # the alternative to ``Cache.crop()`` (INT2 group-128 boundaries don't
+    # allow arbitrary-length truncation); for bf16 we still use crop, so
+    # the snapshot is only kept when the cache exposes ``snapshot()``.
+    pkv = session.past_key_values
+    kv_snapshot = pkv.snapshot() if hasattr(pkv, "snapshot") else None
+
     cache_entry = {
         "disabled": False,
         "session": session,
         "history_len": history_len,
         "history_processed_ids": session.processed_input_ids.detach().clone(),
         "history_delta_state": _snapshot_delta_state(model),
+        "kv_snapshot": kv_snapshot,
     }
     _history_kv_cache[sample_id] = cache_entry
     return cache_entry
@@ -467,10 +485,22 @@ def _ensure_conversation_cache(model, tokenizer, device, sample, *, seed, answer
 
 def _restore_session_to_history(model, session, cache_entry):
     """Roll session state back to the history-only checkpoint so the next
-    question's _ingest_full_ids only processes its question suffix."""
+    question's _ingest_full_ids only processes its question suffix.
+
+    Two restore mechanisms depending on cache class:
+      * cache exposes ``restore_from`` (OSCARCache): replay the snapshot
+        captured at history end. INT2 quantized middle is restored verbatim,
+        avoiding the group-boundary problem that makes ``crop`` impractical.
+      * cache exposes ``crop`` (DynamicCache for bf16): truncate to
+        history_len in place.
+    """
     history_len = cache_entry["history_len"]
-    if session.past_key_values is not None:
-        session.past_key_values.crop(history_len)
+    pkv = session.past_key_values
+    if pkv is not None:
+        if cache_entry.get("kv_snapshot") is not None and hasattr(pkv, "restore_from"):
+            pkv.restore_from(cache_entry["kv_snapshot"])
+        elif hasattr(pkv, "crop"):
+            pkv.crop(history_len)
     session.processed_input_ids = cache_entry["history_processed_ids"].detach().clone()
     _restore_delta_state(model, cache_entry["history_delta_state"])
 
@@ -504,15 +534,17 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    # When any KV quantisation backend is active, force the fresh-prefill
-    # path. Cross-question cache reuse depends on Cache.crop(); the
-    # quantised cache classes either don't preserve correctness under
-    # crop (TurboQuantCache's quantised layers) or have residual/quantised
-    # interactions that aren't safe to crop into (QuantizedCache with
-    # quanto/hqq backend). Falling back to fresh per-question prefill is
-    # slower but always correct.
+    # Cross-question cache reuse requires either Cache.crop() (works for
+    # bf16 DynamicCache) or the OSCAR-style snapshot/restore that we
+    # captured at history end. The other quantised backends (turboquant,
+    # quanto, hqq) don't expose a reuse-safe API yet, so they always go
+    # through the fresh-prefill path.
     cache_hit_attempt = (
-        KV_CACHE_BACKEND == "bf16" and not cache_entry.get("disabled", True)
+        not cache_entry.get("disabled", True)
+        and (
+            KV_CACHE_BACKEND == "bf16"
+            or (KV_CACHE_BACKEND == "oscar" and cache_entry.get("kv_snapshot") is not None)
+        )
     )
     if cache_hit_attempt:
         # Sanity check: the cached history must be a true prefix of this
@@ -595,18 +627,32 @@ def _chunked_official_full_history_answer(
     rng_devices = []
     if torch.cuda.is_available() and device.startswith("cuda"):
         rng_devices = [torch.device(device)]
-    with torch.random.fork_rng(devices=rng_devices):
-        torch.manual_seed(seed + question_index)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed + question_index)
-        generated_ids = session._decode_generate(
-            last_logits,
-            max_new_tokens,
-            do_sample=do_sample,
-            temperature=OFFICIAL_TEMPERATURE if temperature is None else float(temperature),
-            top_p=OFFICIAL_TOP_P if top_p is None else float(top_p),
-            top_k=OFFICIAL_TOP_K if top_k in (None, 0) else int(top_k),
-        )
+    # Freeze delta-mem state during answer decode. The dominant per-token
+    # cost on the delta arm is _memory_affine_scan_torch (a Python for-loop
+    # over generated tokens, ~9 small CUDA launches per layer per token);
+    # delta-mem's *state* represents what is being remembered from the
+    # prompt, not what the model is generating, so freezing on the answer
+    # tokens is paper-safe. The vendored _batched_generate_raw_predictions
+    # toggles this for base mode but our chunked path forgot to. Restored
+    # in a try/finally so an exception path doesn't leave the model in a
+    # half-frozen state.
+    from deltamem.core.delta_impl import set_delta_mem_write_enabled
+    set_delta_mem_write_enabled(model, False)
+    try:
+        with torch.random.fork_rng(devices=rng_devices):
+            torch.manual_seed(seed + question_index)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed + question_index)
+            generated_ids = session._decode_generate(
+                last_logits,
+                max_new_tokens,
+                do_sample=do_sample,
+                temperature=OFFICIAL_TEMPERATURE if temperature is None else float(temperature),
+                top_p=OFFICIAL_TOP_P if top_p is None else float(top_p),
+                top_k=OFFICIAL_TOP_K if top_k in (None, 0) else int(top_k),
+            )
+    finally:
+        set_delta_mem_write_enabled(model, True)
 
     raw_prediction = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
     canonical_prediction = canonicalize_locomo_prediction(raw_prediction, question_spec)

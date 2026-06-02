@@ -18,15 +18,15 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Headline
 
-- Our delta-mem-vs-frozen-backbone ratio: **0.00×**
+- Our delta-mem-vs-frozen-backbone ratio: **0.90×**
 - Paper's reported ratio: **1.20×**
 - Tolerance band: **±0.05**
-- Deviation from paper: **1.20**
+- Deviation from paper: **0.30**
 
 ## Scores
 
-- delta-mem score: **0.0000**
-- frozen backbone score: **0.2379**
+- delta-mem score: **0.2000**
+- frozen backbone score: **0.2222**
 
 ## Run metadata
 
@@ -54,4 +54,4 @@ See the "Eval config" section below for `methodology_adjustment` and related key
 
 ## Investigation note
 
-Our ratio of 0.00 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
+Our ratio of 0.90 is below 1.0 — delta-mem failed to improve over the frozen backbone in our run. Treat as a failure of the reproduction; investigate before declaring Tier 1 complete.
