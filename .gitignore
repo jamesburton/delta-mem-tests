@@ -21,3 +21,6 @@ outputs/
 .vscode/
 .idea/
 *.swp
+
+# Claude Code session state (cron job locks etc)
+.claude/
