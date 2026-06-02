@@ -113,7 +113,15 @@ elif KV_CACHE_BACKEND == "oscar":
     _OSCAR_GROUP = int(os.environ.get("OSCAR_GROUP_SIZE", "128"))
 
 
-_OSCAR_ROTATIONS_BAKED = False
+# Track which attention identity (by id of the first self_attn module) we
+# have already rotated. The eval swaps each ``Qwen3Attention`` for a
+# ``DeltaMemAttention`` wrapper between the base and delta arms; when that
+# swap happens, the layer-0 ``self_attn`` is a new Python object and we need
+# to re-run apply_rotations to patch the new instances. Checking object id
+# is the simplest reliable signal that "the attention has been replaced".
+_OSCAR_ROTATED_ATTN_ID: int = 0
+_OSCAR_K_ROT_CACHE = None
+_OSCAR_V_ROT_CACHE = None
 
 
 def _new_kv_cache(model):
@@ -121,7 +129,7 @@ def _new_kv_cache(model):
     for the bf16 default, in which case the caller leaves
     `session.past_key_values` unset and the model creates a DynamicCache.
     """
-    global _OSCAR_ROTATIONS_BAKED
+    global _OSCAR_ROTATED_ATTN_ID, _OSCAR_K_ROT_CACHE, _OSCAR_V_ROT_CACHE
     if KV_CACHE_BACKEND == "bf16":
         return None
     if KV_CACHE_BACKEND == "turboquant":
@@ -135,22 +143,26 @@ def _new_kv_cache(model):
             nbits=bits,
         )
     if KV_CACHE_BACKEND == "oscar":
-        if not _OSCAR_ROTATIONS_BAKED:
-            # Wire exactly once per process. apply_rotations is idempotent in
-            # principle (overwrites the buffers, no-ops the class patch) but
-            # we still gate on the flag to avoid the extra .pt load and the
-            # log spam.
-            k_rot = load_rotation_file(_OSCAR_K_PATH)
-            v_rot = load_rotation_file(_OSCAR_V_PATH)
+        current_attn = model.model.layers[0].self_attn
+        if id(current_attn) != _OSCAR_ROTATED_ATTN_ID:
+            # Either first call this process, or attach_delta_adapter_in_place
+            # replaced the attention modules between arms. Re-rotate.
+            if _OSCAR_K_ROT_CACHE is None:
+                _OSCAR_K_ROT_CACHE = load_rotation_file(_OSCAR_K_PATH)
+                _OSCAR_V_ROT_CACHE = load_rotation_file(_OSCAR_V_PATH)
+            attn_kind = type(current_attn).__name__
             print(
-                f"[oscar] applying rotations from k={_OSCAR_K_PATH} "
-                f"v={_OSCAR_V_PATH} (objectives k='{k_rot.objective}' "
-                f"v='{v_rot.objective}' head_dim={k_rot.head_dim} "
-                f"layers={len(k_rot)})",
+                f"[oscar] applying rotations to {attn_kind} "
+                f"(objectives k='{_OSCAR_K_ROT_CACHE.objective}' "
+                f"v='{_OSCAR_V_ROT_CACHE.objective}' "
+                f"head_dim={_OSCAR_K_ROT_CACHE.head_dim} "
+                f"layers={len(_OSCAR_K_ROT_CACHE)})",
                 flush=True,
             )
-            apply_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
-            _OSCAR_ROTATIONS_BAKED = True
+            apply_rotations(
+                model, k_rotations=_OSCAR_K_ROT_CACHE, v_rotations=_OSCAR_V_ROT_CACHE,
+            )
+            _OSCAR_ROTATED_ATTN_ID = id(current_attn)
         bits = KV_CACHE_BITS if KV_CACHE_BITS > 0 else 2
         return OSCARCache(
             config=model.config,
