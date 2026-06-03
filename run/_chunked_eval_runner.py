@@ -534,17 +534,19 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    # Cross-question cache reuse requires either Cache.crop() (works for
-    # bf16 DynamicCache) or the OSCAR-style snapshot/restore that we
-    # captured at history end. The other quantised backends (turboquant,
-    # quanto, hqq) don't expose a reuse-safe API yet, so they always go
-    # through the fresh-prefill path.
+    # Cross-question cache reuse requires Cache.crop() (works for bf16
+    # DynamicCache only). The OSCAR snapshot/restore path WAS enabled
+    # here but produced base-arm quality regression (0.2379 -> 0.1106) at
+    # 17k context AND a delta-arm collapse (likely from base-arm K/V
+    # leaking into delta-arm via the cross-arm cache mismatch — both arms
+    # share _history_kv_cache by sample_id but the delta arm wraps each
+    # Qwen3Attention in a DeltaMemAttention that adds delta corrections to
+    # K/V before write). Disabling pending a fix; v3b run captured at
+    # outputs/oscar_gpqacal_v3b_conv0_smoke.json. The other quantised
+    # backends never supported reuse.
     cache_hit_attempt = (
         not cache_entry.get("disabled", True)
-        and (
-            KV_CACHE_BACKEND == "bf16"
-            or (KV_CACHE_BACKEND == "oscar" and cache_entry.get("kv_snapshot") is not None)
-        )
+        and KV_CACHE_BACKEND == "bf16"
     )
     if cache_hit_attempt:
         # Sanity check: the cached history must be a true prefix of this
