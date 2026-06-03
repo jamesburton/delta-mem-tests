@@ -172,3 +172,176 @@ The model outputs are gibberish under HQQ-2bit. Sample raw predictions:
 So the next experimental step is to port OSCAR's rotation+quantize math into a `transformers.Cache` subclass (avoiding the SGLang dependency), compute Qwen3-4B-Instruct rotations, and re-run on conv-0. That's the work tracked for the staged OSCAR sub-repo.
 
 Raw artifacts: `outputs/hqq2_conv0_smoke.json`, `report/raw/locomo-{stdout,driver}-hqq2-conv0.log`.
+
+## Appendix D: OSCAR INT2 KV + delta-mem on Qwen3-4B-Instruct-2507
+
+The OSCAR sub-repo work landed: ported to a `transformers.Cache` subclass
+(`third_party/oscar-transformers`, MIT, also at
+[github.com/jamesburton/oscar-transformers](https://github.com/jamesburton/oscar-transformers)),
+calibrated against Qwen3-4B-Instruct-2507 on GPQA via a native HF transformers
+Q/K/V dumper (`run/oscar_dump_qkv.py` — no SGLang needed), and run end-to-end
+on the conv-0 / first 10 questions slice. Headline:
+
+| condition (conv-0, first 10 q) | base | delta | ratio |
+|---|---:|---:|---:|
+| bf16/TQ4 reference (Appendix B) | 0.3344 | 0.3342 | 0.999 |
+| HQQ2 naive (Appendix C) | 0.0000 | 0.0000 | n/a |
+| OSCAR INT2 — RotationZoo Thinking-2507 rotations, naive port | 0.0432 | 0.0215 | 0.498 |
+| OSCAR INT2 — GPQA-cal Instruct rotations, continuous-zero fix | 0.2379 | 0.0000 | 0.000 |
+| **OSCAR INT2 — + delta-mem-aware patch (v2)** | **0.2379** | **0.3642** | **1.531** |
+
+The headline (v2) row preserves the bf16 delta-mem quality (0.3342 → 0.3642
+within noise) while the KV cache stays INT2 in the middle region —
+**~7× reduction in KV cache memory** at 17.5 k context, matching what the
+HQQ2 experiment in Appendix C hoped to deliver but at usable quality.
+
+The 1.53× delta-mem-vs-base ratio is *higher* than the paper's reported
+1.20×, even though our absolute base score (0.2379) is below the
+bf16/TQ4 base (0.3344): OSCAR's INT2 quantization mildly degrades the raw
+context in the base arm, while the delta-mem compressed state is
+unaffected by KV quantization, so delta-mem provides *more* complementary
+signal against a degraded base. That same effect persists in v3c
+(`outputs/oscar_gpqacal_v3c_conv0_smoke.json`) — base 0.1333 / delta
+0.3164 / ratio 2.37 — where the base arm regressed further due to a bf16
+precision issue in a Tier-1 optimization (see "Open follow-ups" below).
+
+### Calibration: native HF transformers dump, no SGLang
+
+Upstream's OSCAR calibration runs through a vendored SGLang fork
+(`sglang-dump-qkv/`) which is Linux-only. We reimplemented the dump phase
+in plain HF transformers (`run/oscar_dump_qkv.py`): a once-per-class
+monkey-patch on `Qwen3Attention.forward` captures post-RoPE Q/K/V into the
+same per-layer chunk layout `compute_kv_rotation.py` expects
+(`<dump_dir>/layer_<id>/{q,k,v}/<chunk_id>.pt`). Vendored
+`run/compute_kv_rotation.py` is upstream's pure-torch rotation compute,
+unmodified. GPQA dump for 198 prompts on a 12 GB card finishes in
+~6 min; rotation compute another ~10 min. Total calibration cost
+< 30 min wall time, no WSL or cloud GPU needed.
+
+Calibration set selection was investigated. GPQA (matches upstream's
+recipe) and LoCoMo (matches our eval distribution) both produced
+rotations that preserved the OSCAR pipeline's needle-recall property;
+neither addressed the original failure cases (see below). Per the int4-
+vs-int2 research summary, calibration choice mostly does not matter at
+INT2 once the quantizer is correct.
+
+### The two real bugs we found in the OSCAR port
+
+**Bug 1: discrete zero-point in the INT2 quantizer.** The per-token
+asymmetric INT2 quantizer (`oscar_transformers/quantize.py`) was rounding
+the zero-point to an integer in `{0, 1, 2, 3}` before storing it to fp16.
+With only 4 quantization levels, snapping zero to an integer shifts the
+whole grid by up to `scale/2` per group — empirically enough to wipe
+mid-prompt recall on Qwen3-4B-Instruct on the 4 k middle-region needle
+smoke (`run/oscar_smoke_middle.py`) with a needle at position 1500.
+Upstream's reference `simulate_int2_asym` in
+`rotation/compute_kv_rotation.py` keeps the zero-point continuous, and so
+does our fix. Dequant formula already does the right thing if `zero` is
+continuous fp16 (the existing storage format).
+
+**Bug 2: `apply_rotations` bypasses delta-mem's attention.** delta-mem's
+`attach_delta_adapter_in_place` swaps each `Qwen3Attention` for a
+`DeltaMemAttention` wrapper that re-implements attention internally — it
+does NOT delegate back to `self.base.forward`. Our class-level
+`Qwen3Attention.forward` patch was therefore dead code on the delta arm.
+K/V flowed into `OSCARCache` *unrotated*, matching exactly the failure
+case of port-debug test C (identity rotation + OSCARCache → gibberish).
+Fix: detect `DeltaMemAttention` (duck-type), patch
+`_apply_standard_rotary` and `_normalize_value_states` at *instance*
+level (not class level — avoids collisions with delta-mem's own
+class-level setup), and bake R_v.T into `self.base.o_proj.weight`
+directly so the un-rotation site after delta-mem's attention call works
+without us monkeypatching the whole 100+-line forward.
+
+Together these two fixes are what moved the delta arm from 0.0000 to
+0.3642 on conv-0/10q.
+
+### Discriminating with port-debug
+
+`run/oscar_port_debug.py` is a four-test diagnostic that surfaced both
+bugs and now serves as a regression suite. Tests run on a 4 k synthetic
+prompt with a distinctive access-code needle at position 1500:
+
+| test | rotation | cache | needle? | meaning |
+|---|---|---|:---:|---|
+| baseline | none | DynamicCache | YES | reference |
+| A | identity | DynamicCache | **YES, byte-identical** | rotation+un-rotation wrapper is correct |
+| B | GPQA-cal | DynamicCache | **YES, byte-identical** | rotation math is correct in bf16 |
+| C | identity | OSCARCache(int2) | NO (gibberish) | INT2 alone destroys unrotated K/V — rotation IS the load-bearing piece |
+| D | GPQA-cal | OSCARCache(int2) | **YES, byte-identical** | full pipeline works at 4 k context |
+
+Test D byte-matching baseline is a *stronger* validation than v2 had —
+the R_v.T bake into `o_proj.weight` removes one bf16 einsum step, so
+runtime numerics are slightly cleaner with the bake than without.
+
+### Tier-1 optimization stack (partial)
+
+Research from four parallel sub-agents pointed at the following
+implementable wins (full ranking in `.planning/research/synthesis.md`):
+
+1. OSCAR snapshot/restore for cross-question history reuse (skip the
+   17.6 k token re-prefill per question)
+2. Bake R_v.T into `o_proj.weight` (remove the heaviest decode einsum)
+3. Freeze delta-mem writes during answer decode (kill the
+   `_memory_affine_scan_torch` per-decoded-token cost)
+4. Pre-allocate `_assemble` output buffer
+5. Install Triton for the delta-mem scan
+6. Move to INT4 (planned; v4)
+7. Speculative decoding with Qwen3-0.6B (no-go in 48 h —
+   `_assisted_decoding` requires `Cache.crop` which OSCAR cannot honor
+   without dequant/re-quant of the group-128 INT2 blocks)
+
+Items 2 (o_proj bake) and 3 (frozen writes) landed; (1) snapshot/restore
+landed but produced a regression we backed out (see follow-ups below);
+(4) wasn't needed once the per-step dequant fast-path landed in v1;
+(5) Triton installs but delta-mem auto-detection did not engage on this
+host. v3c isolates items 2 and 3
+(`outputs/oscar_gpqacal_v3c_conv0_smoke.json`).
+
+Decode wall time on the delta arm did drop in v3c from v2's 38 min/q to
+~36 min/q. The bigger speed wins were *latent* in v3b (snapshot/restore
+on plus correct rotation) where the delta-arm pacing was 14 min/q — but
+v3b was numerically broken, so the speed measurement doesn't transfer
+until the snapshot/restore bug is resolved.
+
+### Open follow-ups
+
+- **o_proj bake bf16-precision regression at 17 k.** The bake is
+  mathematically exact (port-debug test D byte-matches baseline at 4 k)
+  but on the 17 k LoCoMo prompts the bf16 bake einsum apparently
+  accumulates enough noise across 36 layers to drop base-arm quality
+  (v2 0.2379 → v3c 0.1333). Pending: v3d with the bake compute upgraded
+  to fp32 then cast back to bf16 for storage (committed in
+  `oscar-transformers @ a4740c9`). If v3d base recovers, fp32 bake is the
+  right ship; if not, the bake's runtime cost is small enough to leave
+  it out and revert to the inline un-rotation einsum.
+- **Cross-arm OSCAR snapshot/restore mismatch.** The base arm fills the
+  cache with Qwen3-projection K/V (no delta-mem); after
+  `attach_delta_adapter_in_place`, the delta arm computes new K/V with
+  delta-mem corrections via `_apply_delta_qkv`. Restoring the base-arm
+  snapshot into the delta arm therefore mixes K/V from two different
+  computation paths and the model produces word-salad. bf16 with crop()
+  has the same conceptual mismatch but bf16 noise lets it stay usable;
+  OSCAR's tighter precision budget tips it into failure. Fix:
+  invalidate the cache when `layer.self_attn` identity changes (i.e.
+  when delta-mem attaches) and re-prefill once for the delta arm. Keeps
+  the within-arm reuse benefit. Deferred — not attempted in the 48 h
+  window.
+- **INT4 trade study.** Per `.planning/research/int4-vs-int2.md`, OSCAR's
+  eigenbasis rotation is INT2-specific; KIVI-4 / Saw-INT4 / QuaRot-INT4
+  are near-bf16 *without* rotation. v4a (INT4 + GPQA-cal rotation) and
+  v4b (INT4 + identity rotation, raw INT4 control) are queued as the
+  cleanest follow-up. Memory cost INT2→INT4 is +312 MB on the 17 k
+  middle region — still vastly less than bf16's raw KV.
+
+Raw artifacts:
+`outputs/oscar_conv0_smoke.json` (v1, broken Thinking rotations),
+`outputs/oscar_gpqacal_conv0_smoke.json` (v1.5, continuous-zero fix only),
+`outputs/oscar_gpqacal_v2_conv0_smoke.json` (v2, **headline**),
+`outputs/oscar_gpqacal_v3_conv0_smoke.json` (v3, o_proj bake einsum bug),
+`outputs/oscar_gpqacal_v3b_conv0_smoke.json` (v3b, snapshot/restore bug),
+`outputs/oscar_gpqacal_v3c_conv0_smoke.json` (v3c, o_proj+frozen, no snapshot).
+
+The four-agent research that drove the Tier-1 plan is in
+`.planning/research/{rotation-fusion,int4-vs-int2,speculative-decoding,delta-mem-speedups,synthesis,spec-d-spike}.md`.
+
