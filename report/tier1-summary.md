@@ -306,15 +306,19 @@ until the snapshot/restore bug is resolved.
 
 ### Open follow-ups
 
-- **o_proj bake bf16-precision regression at 17 k.** The bake is
-  mathematically exact (port-debug test D byte-matches baseline at 4 k)
-  but on the 17 k LoCoMo prompts the bf16 bake einsum apparently
-  accumulates enough noise across 36 layers to drop base-arm quality
-  (v2 0.2379 → v3c 0.1333). Pending: v3d with the bake compute upgraded
-  to fp32 then cast back to bf16 for storage (committed in
-  `oscar-transformers @ a4740c9`). If v3d base recovers, fp32 bake is the
-  right ship; if not, the bake's runtime cost is small enough to leave
-  it out and revert to the inline un-rotation einsum.
+- **o_proj bake should not ship — reverted.** Test sequence:
+    - v3c (bf16 bake): base 0.2379 → 0.1333 (-44%), delta 0.3642 → 0.3164 (-13%)
+    - v3d (fp32 bake then cast): base 0.1961 (partial recovery), delta
+      0.1494 (further regression)
+
+  The fp32 bake recovers half of v3c's base regression but degrades the
+  delta arm more than v3c did. Hypothesis: delta-mem's `delta_o` LoRA was
+  trained against the unbaked `base.o_proj`, so adding delta_o to a
+  baked-perturbed `base_o_output` disrupts the trained additive balance.
+  v2's design (no bake, runtime un-rotation einsum) is the correct
+  production setup. The bake code stays in `oscar-transformers` as an
+  experimental knob behind the rotation API but is no longer applied on
+  the eval path.
 - **Cross-arm OSCAR snapshot/restore mismatch.** The base arm fills the
   cache with Qwen3-projection K/V (no delta-mem); after
   `attach_delta_adapter_in_place`, the delta arm computes new K/V with
