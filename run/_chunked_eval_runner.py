@@ -409,8 +409,29 @@ def _restore_delta_state(model, snapshot):
 
 def _ensure_conversation_cache(model, tokenizer, device, sample, *, seed, answer_reserve_tokens):
     sample_id = str(sample["sample_id"])
+    current_attn_id = id(model.model.layers[0].self_attn)
     if sample_id in _history_kv_cache:
-        return _history_kv_cache[sample_id]
+        existing = _history_kv_cache[sample_id]
+        # Cross-arm invalidation: attach_delta_adapter_in_place replaces every
+        # Qwen3Attention with a DeltaMemAttention wrapper between the base and
+        # delta arms. K/V values written by the two attention classes are NOT
+        # interchangeable (DeltaMemAttention adds delta-mem corrections inside
+        # _apply_delta_qkv). If the cache was built under a different attention
+        # identity, restoring it would mix two computation paths -> word salad
+        # (see outputs/oscar_gpqacal_v3b_conv0_smoke.json: delta arm = 0.0000).
+        # Evict and rebuild under the current attention class.
+        if existing.get("built_under_attn_id") != current_attn_id:
+            _history_kv_cache.pop(sample_id, None)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(
+                f"[kv-cache invalidate sample={sample_id}] attention identity "
+                f"changed (likely arm switch); evicting and rebuilding.",
+                flush=True,
+            )
+        else:
+            return existing
     _evict_other_caches(sample_id)
 
     history_len = _compute_history_len(
@@ -478,6 +499,10 @@ def _ensure_conversation_cache(model, tokenizer, device, sample, *, seed, answer
         "history_processed_ids": session.processed_input_ids.detach().clone(),
         "history_delta_state": _snapshot_delta_state(model),
         "kv_snapshot": kv_snapshot,
+        # Track which attention identity (base Qwen3Attention vs. delta-arm
+        # DeltaMemAttention wrapper) built this cache, so the guard at the top
+        # of this function can invalidate it when the eval swaps arms.
+        "built_under_attn_id": id(model.model.layers[0].self_attn),
     }
     _history_kv_cache[sample_id] = cache_entry
     return cache_entry
@@ -534,19 +559,20 @@ def _chunked_official_full_history_answer(
         seed=seed, answer_reserve_tokens=answer_reserve_tokens,
     )
 
-    # Cross-question cache reuse requires Cache.crop() (works for bf16
-    # DynamicCache only). The OSCAR snapshot/restore path WAS enabled
-    # here but produced base-arm quality regression (0.2379 -> 0.1106) at
-    # 17k context AND a delta-arm collapse (likely from base-arm K/V
-    # leaking into delta-arm via the cross-arm cache mismatch — both arms
-    # share _history_kv_cache by sample_id but the delta arm wraps each
-    # Qwen3Attention in a DeltaMemAttention that adds delta corrections to
-    # K/V before write). Disabling pending a fix; v3b run captured at
-    # outputs/oscar_gpqacal_v3b_conv0_smoke.json. The other quantised
-    # backends never supported reuse.
+    # Cross-question cache reuse:
+    #   * bf16 DynamicCache: uses Cache.crop()
+    #   * OSCARCache: uses snapshot()/restore_from() — supports cross-arm
+    #     reuse safely now that _ensure_conversation_cache invalidates the
+    #     entry when the attention class changes between arms (see the
+    #     built_under_attn_id guard above). Previously this path produced a
+    #     delta-arm collapse to 0.0000 because the base-arm Qwen3Attention
+    #     K/V were being restored under the delta-arm DeltaMemAttention,
+    #     mixing two computation paths (outputs/oscar_gpqacal_v3b_conv0_smoke.json).
+    # Other quantised backends (turboquant/quanto/hqq) still don't support
+    # safe reuse.
     cache_hit_attempt = (
         not cache_entry.get("disabled", True)
-        and KV_CACHE_BACKEND == "bf16"
+        and KV_CACHE_BACKEND in ("bf16", "oscar")
     )
     if cache_hit_attempt:
         # Sanity check: the cached history must be a true prefix of this
