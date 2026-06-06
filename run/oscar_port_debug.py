@@ -21,6 +21,11 @@ Tests (all on the same 4 k prompt with the needle at position ~1500):
   test C      identity rotation, OSCARCache(int2)         expected: needle ? (quant noise only)
                                                           fails ⇒ INT2 itself destroys recall regardless of basis
                                                           passes ⇒ rotation+quant interaction is the bug
+  test D      GPQA-cal rotation, OSCARCache(int2)         expected: needle (the production INT2 config)
+  test E      identity rotation, OSCARCache(int4)         expected: needle ? (raw INT4 control)
+                                                          fails ⇒ identity is wrong basis for INT4 too
+  test F      GPQA-cal rotation, OSCARCache(int4)         expected: needle (INT4 with rotation)
+                                                          fails ⇒ rotations don't generalise from INT2 to INT4
 
 Reuses the build_context helper from oscar_smoke_middle to keep the prompt
 identical to the prior smoke runs.
@@ -174,6 +179,26 @@ def main() -> int:
     print(f"  matches baseline: {pred == baseline_pred}")
     results.append(_summarize("test_D_gpqa_oscar_int2", pred, baseline=baseline_pred))
 
+    # ----- test E: identity rotation, OSCARCache(int4) -----
+    print("\n=== test E: identity rotation, OSCARCache(int4) ===", flush=True)
+    apply_rotations(model, k_rotations=id_set, v_rotations=id_set)
+    cache = OSCARCache(config=model.config, bits=4)
+    pred, _, elapsed = _generate(model, tokenizer, prompt, cache=cache)
+    print(f"  elapsed={elapsed:.1f}s")
+    print(f"  pred: {pred!r}")
+    print(f"  matches baseline: {pred == baseline_pred}")
+    results.append(_summarize("test_E_identity_oscar_int4", pred, baseline=baseline_pred))
+
+    # ----- test F: GPQA-cal rotation, OSCARCache(int4) -----
+    print("\n=== test F: GPQA-cal rotation, OSCARCache(int4) ===", flush=True)
+    apply_rotations(model, k_rotations=k_rot, v_rotations=v_rot)
+    cache = OSCARCache(config=model.config, bits=4)
+    pred, _, elapsed = _generate(model, tokenizer, prompt, cache=cache)
+    print(f"  elapsed={elapsed:.1f}s")
+    print(f"  pred: {pred!r}")
+    print(f"  matches baseline: {pred == baseline_pred}")
+    results.append(_summarize("test_F_gpqa_oscar_int4", pred, baseline=baseline_pred))
+
     # ----- SUMMARY -----
     print("\n=== SUMMARY ===", flush=True)
     print(f"  {'test':<35} {'needle':>7} {'==baseline':>11}")
@@ -190,6 +215,7 @@ def main() -> int:
     print("  test A passes, test B fails  -> bf16 rotation precision bug")
     print("  tests A,B pass, test C fails needle  -> INT2 itself loses recall regardless of basis")
     print("  tests A,B,C pass needle, D fails  -> rotation+quant interaction is the bug")
+    print("  test F passes, E fails  -> INT4 also needs rotation; raw INT4 is degenerate")
     print("  all tests pass needle  -> port is correct; bug is elsewhere")
     return 0
 
