@@ -394,7 +394,36 @@ showed on-demand dequant costs ~40 ms per layer per call (~1.4 s/step
 × 36 layers), adding ~24 minutes to a 10 q eval — and partial-buffer
 schemes don't help because every decode step touches the full middle.
 Marked as out-of-scope for the 48 h window; would only matter past
-17 k context.
+17 k context. An opt-out env var ``OSCAR_DISABLE_DEQUANT_SHADOW=1``
+is wired in (submodule 3835184) so context-ceiling experiments past
+17 k can trade the runtime for VRAM if needed.
+
+### Update — v5 (clean reproduction with all fixes)
+
+Re-ran the INT2 + GPQA-rot conv-0/10q config end-to-end on the current
+pipeline (packing + cross-arm invalidation + delta-mem write freeze).
+Reproduces v2's delta score exactly:
+
+| Run | base | delta | ratio |
+|-----|------|-------|-------|
+| v2 (Jun 2, pre-packing, pre-invalidation) | 0.2379 | **0.3642** | 1.531 |
+| **v5 (current pipeline)** | **0.2735** | **0.3642** | **1.332** |
+
+Delta is bit-identical (4 dp). Base lifted by 15 % — likely a downstream
+benefit of the cross-arm invalidation cleaning up a subtle bf16-vs-OSCAR
+mix that was happening before. Ratio still well above paper's 1.20.
+
+Category breakdown of v5 delta arm:
+
+| category | n | score |
+|----------|---|-------|
+| multi_hop | 3 | **0.667** (vs base 0.140 — 4.8× win) |
+| temporal | 6 | 0.218 |
+| open_domain | 1 | 0.333 |
+
+The multi-hop dominance suggests the delta-mem state is doing what it
+was trained for: bridging long-range references that the frozen INT2
+cache loses precision on.
 
 Raw artifacts:
 `outputs/oscar_conv0_smoke.json` (v1, broken Thinking rotations),
