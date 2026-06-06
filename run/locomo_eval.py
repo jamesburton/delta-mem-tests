@@ -311,7 +311,17 @@ def main() -> int:
         help="(Deprecated) Backwards-compat for --kv-cache-backend turboquant "
              "--kv-cache-bits N. If > 0, equivalent to those flags.",
     )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=0,
+        help="Override EVAL_CONFIG['eval_batch_size'] (default 2). Use 1 to "
+             "halve attention scratch memory for VRAM-constrained long-context "
+             "runs at the cost of ~2x wall-time.",
+    )
     args = parser.parse_args()
+    if args.eval_batch_size > 0:
+        EVAL_CONFIG["eval_batch_size"] = args.eval_batch_size
     # Backwards compat: --turboquant-bits implies --kv-cache-backend turboquant.
     if args.turboquant_bits > 0 and args.kv_cache_backend == "bf16":
         args.kv_cache_backend = "turboquant"

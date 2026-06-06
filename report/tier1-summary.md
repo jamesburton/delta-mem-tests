@@ -425,6 +425,58 @@ The multi-hop dominance suggests the delta-mem state is doing what it
 was trained for: bridging long-range references that the frozen INT2
 cache loses precision on.
 
+### Update — context-scaling sweep (v6 / v6b / v6c)
+
+With ~2 GB freed by packing, the natural next question: how far past
+17 k can the combo go while delta-mem still wins? Tested by running
+LoCoMo's largest natural conversation (conv-41, 25,672 prompt tokens)
+under three configurations:
+
+| Run | Config | Outcome | base | delta | ratio |
+|-----|--------|---------|------|-------|-------|
+| v6 | shadow ON, batch=2 | crashed in delta arm rebuild | 0.231 (10/10) | — | — |
+| v6b | shadow OFF, batch=2 | crashed at delta q4 | 0.231 (10/10) | 0.089 (4/10, partial) | — |
+| **v6c** | **shadow OFF, batch=1** | **clean 10+10** | **0.231** | **0.139** | **0.602** |
+
+**Key finding: delta-mem's strength does not persist past ~17 k. At
+25 k the ratio flips from 1.33 × win to 0.60 × loss.** The base arm
+holds up moderately (0.27 → 0.23, -16 %), but the delta arm collapses
+(0.36 → 0.14, -62 %). Multi-hop — delta-mem's flagship category — drops
+from 0.67 at 17 k to 0.19 at 25 k.
+
+Mechanism (hypothesis):
+- The delta-mem adapter (declare-lab/delta-mem_qwen3_4b-instruct) was
+  trained on contexts in the 17-k class.
+- At 25 k the additional KV history is out-of-distribution for the
+  delta state computation, so the corrections it produces inject
+  noise instead of recall.
+- The frozen INT2-rotated base arm degrades gracefully (it's just
+  attention with quantized values, no learned overlay).
+
+**Practical ceiling on a 12 GB card:**
+
+| Context | OSCAR-INT2 + delta-mem | Notes |
+|---------|------------------------|-------|
+| ≤ 17 k  | **production-quality** (ratio 1.33) | conv-26 fits batch=2, shadow ON |
+| 17 - 22 k | likely works but untested | extrapolation |
+| 22 - 26 k | base arm fits batch=2; delta arm needs batch=1 + shadow OFF; **quality regresses** | conv-41 measured |
+| ≥ 26 k | OOM even with batch=1 + shadow OFF | extrapolation |
+
+The 12 GB VRAM ceiling and the delta-mem quality ceiling **happen to
+coincide near 25 k** — for this stack at this scale, there is no
+configuration where stretching context further is useful. To extend
+the working range, the next move would be retraining (or finetuning)
+the delta-mem adapter on longer-context data, not further VRAM tricks.
+
+Bench notes from the sweep:
+- `eval-batch-size=1` halves attention scratch peak; makes delta arm
+  at 25 k stable but ~2× wall-time. New CLI flag added to
+  `run/locomo_eval.py`.
+- `OSCAR_DISABLE_DEQUANT_SHADOW=1` gets the cache through delta-arm
+  rebuild at 25 k but isn't enough alone; need batch=1 too.
+- Practical wall-time for 10 q at 25 k with batch=1, shadow OFF:
+  ~3.5 h on RTX 3060 12 GB.
+
 Raw artifacts:
 `outputs/oscar_conv0_smoke.json` (v1, broken Thinking rotations),
 `outputs/oscar_gpqacal_conv0_smoke.json` (v1.5, continuous-zero fix only),
