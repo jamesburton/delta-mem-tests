@@ -338,6 +338,64 @@ until the snapshot/restore bug is resolved.
   cleanest follow-up. Memory cost INT2→INT4 is +312 MB on the 17 k
   middle region — still vastly less than bf16's raw KV.
 
+### Update — INT4 trade study (v4a/v4b/port_debug E+F)
+
+v4b (INT4 + identity rotation, conv-0/10q) collapsed to degraded text
+loops on both arms (base 0.0 / delta 0.0). Initially suspected an INT4
+numerical bug; debunked by extending `oscar_port_debug.py` with two new
+4 k-context tests:
+
+| Test | Config | Result |
+|------|--------|--------|
+| C | INT2 + identity | word salad ("I\n1.\n\nThe...") |
+| D | INT2 + GPQA-rot | partial recall — surfaces needle "QM-7194-ZULU" |
+| **E** | **INT4 + identity** | word salad ("the the the the...") — same failure class as C |
+| **F** | **INT4 + GPQA-rot** | **exact baseline match "QM-7194-ZULU"** |
+
+So at 4 k the INT4 path is bit-correct; rotation is essential even at
+INT4. The research's "raw INT4 is near-bf16" claim does not generalise
+to OSCAR's specific sink/middle/recent layout on Qwen3-4B-Instruct.
+
+The first v4a JSON we trusted (base 0.2832 / delta 0.2395, ratio 0.846)
+turned out to be **stale** — the `locomo_eval` wrapper reuses an
+existing output JSON if present, so the new INT4 process never actually
+ran. Renamed to `*.STALE.json` and re-launched fresh as v4a-real;
+result pending at writeup time.
+
+### Update — codes packing (4-per-byte INT2)
+
+OSCARCache codes were stored 1-per-byte (uint8) regardless of bits,
+so the INT2 path only saved 2× vs bf16 instead of OSCAR's advertised
+~7×. Submodule commit `cd17cb3` packs `(8 // bits)` values per byte
+along head_dim. Measured at one layer of `(1, 8, 17000, 128)` bf16
+reference (Qwen3-4B-Instruct):
+
+| bits | packed savings vs bf16 |
+|------|------------------------|
+| 1 | 12.8× |
+| **2** | **7.1× (the headline)** |
+| 4 | 3.8× |
+| 8 | 1.9× (no packing — already 1-per-byte) |
+
+End-to-end VRAM at 17 k context for codes alone (36 layers × K+V):
+
+| Backend | Codes VRAM | Saved vs bf16 |
+|---------|-----------|---------------|
+| bf16 (frozen baseline) | 2.40 GB | — |
+| OSCAR INT2 unpacked | 1.20 GB | 1.2 GB |
+| **OSCAR INT2 packed** | **0.33 GB** | **2.07 GB** |
+
+Packing alone moved the 12 GB-card budget from OOM-risky to
+comfortable headroom — Qwen3-4B weights (7.5 GB) + packed codes
+(0.33 GB) + dequant shadow (2.5 GB) + activations (~1 GB) ≈ 11.3 GB.
+
+Ring-buffering the dequant shadow was considered next but benchmark
+showed on-demand dequant costs ~40 ms per layer per call (~1.4 s/step
+× 36 layers), adding ~24 minutes to a 10 q eval — and partial-buffer
+schemes don't help because every decode step touches the full middle.
+Marked as out-of-scope for the 48 h window; would only matter past
+17 k context.
+
 Raw artifacts:
 `outputs/oscar_conv0_smoke.json` (v1, broken Thinking rotations),
 `outputs/oscar_gpqacal_conv0_smoke.json` (v1.5, continuous-zero fix only),
