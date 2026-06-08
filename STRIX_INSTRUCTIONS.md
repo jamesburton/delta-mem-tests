@@ -1,0 +1,394 @@
+# Strix Halo training plan — long-context delta-mem adapter, deploy on this host
+
+This document is the handoff for moving delta-mem adapter **training** to a
+Strix Halo box (AMD Ryzen AI Max+ 395, 96 GB allocatable VRAM via Radeon
+8060S iGPU on ROCm) while keeping **inference and evaluation** on the
+current Windows/CUDA host (RTX 3060, 12 GB).
+
+## Why move training off this host
+
+48 h of optimisation on this 12 GB box closed the headline reproduction
+(see `report/tier1-summary.md` Appendix D, commit `ab1257c`):
+
+- OSCAR INT2 + GPQA-cal rotation + delta-mem ratio **1.33×** at 17 k context
+  (paper claims 1.20×).
+- INT2 4-per-byte packing landed (submodule `cd17cb3`) → headline 7.1×
+  memory saving vs bf16.
+- `OSCAR_DISABLE_DEQUANT_SHADOW=1` env var (submodule `3835184`) +
+  `--eval-batch-size 1` flag (commit `ab1257c`) let us stretch to ~25 k.
+- **But** at 25 k the **published adapter** (`declare-lab/delta-mem_qwen3_4b-instruct`)
+  collapses (ratio 0.60×, delta arm -62 %). Likely because it was trained
+  on ~17 k-class contexts and the additional KV history is OOD for the
+  delta-state computation.
+
+The next real win is **retraining/fine-tuning the delta-mem adapter on
+longer-context data** so it stays useful past 20 k. That training is
+infeasible here (12 GB) but well within Strix Halo's 96 GB. Trained
+adapter weights are framework-agnostic safetensors, so cross-deployment
+to this CUDA host is mechanical.
+
+## Goal in one sentence
+
+Produce a delta-mem adapter (`delta-mem_qwen3_4b-instruct-longctx-vN`) that
+extends the **quality ceiling** from ~17 k to ≥32 k, then validate on this
+host that v5 (17 k) reproduces ratio ≥ 1.30 and v6c (25 k) crosses ratio
+≥ 1.20 (currently 0.60).
+
+---
+
+## Hardware preconditions on the training box
+
+| Spec | Required | Notes |
+|------|----------|-------|
+| GPU | Strix Halo (Ryzen AI Max+ 395 / 8060S iGPU, RDNA 3.5) | 96 GB unified-memory cap via BIOS UMA / Variable Graphics Memory setting |
+| RAM | ≥ 128 GB unified | Strix Halo ships 64 / 128 GB variants — the 128 GB SKU is the one this plan targets |
+| OS | Ubuntu 24.04 LTS (or 22.04 LTS) | ROCm 6.2+ on the recent kernels |
+| Disk | ≥ 500 GB free NVMe | model + datasets + checkpoints |
+| Network | Reliable for `huggingface_hub` snapshot pulls | First pull is ~10 GB |
+
+ROCm consumer iGPU support is still less polished than discrete; pick a
+kernel/driver combo from AMD's tested matrix rather than rolling-release.
+
+---
+
+## Software stack
+
+```bash
+# 1. ROCm (host)
+#    Follow https://rocm.docs.amd.com/projects/install-on-linux/en/latest/
+#    Target ROCm 6.2 or newer; iGPU UMA exposed via amdgpu.gpu_recovery=1 and
+#    set GFX_VERSION=11.5.1 (RDNA 3.5) in your shell rc:
+echo 'export HSA_OVERRIDE_GFX_VERSION=11.5.1' >> ~/.bashrc
+echo 'export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True' >> ~/.bashrc
+
+# 2. Python env (uv preferred for parity with this host)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv .venv --python 3.11
+source .venv/bin/activate
+
+# 3. PyTorch (ROCm wheels). Pick the version matching your installed ROCm.
+#    Example for ROCm 6.2:
+uv pip install --index-url https://download.pytorch.org/whl/rocm6.2 \
+    "torch==2.5.1" "torchvision==0.20.1"
+
+# 4. Transformers + accelerate (framework-agnostic)
+uv pip install "transformers==5.9.0" "accelerate>=0.34" "peft>=0.14" \
+    "safetensors" "huggingface_hub" "datasets" "trl"
+
+# 5. Triton (delta-mem scan kernels). PyTorch's ROCm wheel ships HIP-Triton.
+#    Verify import; if it fails, fall back to pure-PyTorch path (see below).
+python -c "import triton; print(triton.__version__)"
+
+# 6. FlashAttention-2 ROCm port (optional; speeds up training prefill)
+#    Built from source per AMD's FA2 ROCm fork; skip if it errors on first try.
+
+# 7. Clone the repos (use the SAME submodule pins as this host)
+git clone --recursive https://github.com/jamesburton/delta-mem-tests
+cd delta-mem-tests
+git submodule update --init --recursive
+uv pip install -e third_party/oscar-transformers   # adapter loader needs this
+```
+
+### Triton kernel fallback
+
+`delta-Mem/deltamem/runtime/session.py` and `delta_impl.py` import Triton
+scan kernels (installed for this host in commit `2e9cced`). On AMD-Triton
+they may fail to JIT-compile. If `python -c "from deltamem.core.delta_impl
+import DeltaMemAttention"` raises a Triton compilation error, set:
+
+```bash
+export DELTA_MEM_DISABLE_TRITON=1   # forces the eager-PyTorch scan path
+```
+
+(Sub-1.5× slower per training step but correctness-equivalent. Long-context
+training is bandwidth-bound on Strix Halo regardless, so the cost is mostly
+hidden.)
+
+### Sanity check before training
+
+```bash
+# Verify CUDA-API compatibility (torch.cuda.* works on ROCm)
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count()); \
+           x=torch.randn(1024, 1024, device='cuda', dtype=torch.bfloat16); \
+           print((x @ x.T).sum().item())"
+
+# Smoke-load Qwen3-4B-Instruct-2507 + the adapter
+python -c "
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+m = AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-4B-Instruct-2507',
+                                          dtype=torch.bfloat16).to('cuda')
+print('model on', m.device, 'mem:', torch.cuda.memory_allocated() / 2**30, 'GB')
+"
+```
+
+---
+
+## Training plan
+
+### Data: long-context conversational memory
+
+The published adapter was trained on the OSAR/LoCoMo-style mixture that
+peaks around 17 k tokens. To push the quality ceiling we need data at the
+target context length **with the same dialogue+QA structure**.
+
+Two sources, both already permissively licensed:
+
+1. **LongMemEval** (`xiaowu0162/long-mem-eval`) — multi-session
+   conversations at 30-50 k tokens, with retrieval-style QA. Direct match
+   for our LoCoMo distribution but longer.
+2. **InfBench** (`xinrongzhang2022/infbench`) — covers 64 k - 128 k
+   conversation/document QA. Strong stress-test data.
+
+For curriculum, mix at:
+- 50 % LoCoMo originals (anchors prior performance) at 8-18 k
+- 30 % LongMemEval at 20-32 k
+- 20 % InfBench-mem at 32-64 k
+
+Curriculum lets the optimiser see the easier 17 k anchor early and avoid
+catastrophic forgetting of the published adapter's strengths.
+
+### Model setup
+
+- Backbone: `Qwen/Qwen3-4B-Instruct-2507` (matches this host; frozen)
+- Init: load published `declare-lab/delta-mem_qwen3_4b-instruct` adapter
+  weights and **continue training**, don't restart from random. This
+  protects the 17 k-class quality already there.
+
+### Hyperparameters (starting point — tune)
+
+```python
+TRAIN = dict(
+    max_seq_len = 32768,            # phase 1 target; phase 2 -> 65536
+    per_device_train_batch_size = 1,
+    gradient_accumulation_steps = 8,
+    learning_rate = 1e-4,           # 10x lower than initial training; we're fine-tuning
+    lr_scheduler = "cosine",
+    warmup_steps = 200,
+    num_train_epochs = 2,
+    weight_decay = 0.01,
+    bf16 = True,
+    gradient_checkpointing = True,  # required at 32 k+ on 96 GB
+    optim = "adamw_torch_fused",
+    eval_steps = 500,
+    save_steps = 1000,
+    logging_steps = 25,
+    # delta-mem-specific
+    freeze_backbone = True,
+    train_adapter_only = True,
+    state_update_mode = "online",   # match inference-time setting
+)
+```
+
+### VRAM budget (estimate at 32 k context, batch=1, grad-checkpoint)
+
+| Component | Size |
+|-----------|------|
+| Qwen3-4B bf16 weights (frozen, no grad) | ~7.5 GB |
+| Adapter weights (trainable) | ~0.2 GB |
+| Adam optimiser states (m, v for adapter) | ~0.6 GB |
+| Activations with grad checkpointing | ~30-40 GB |
+| KV cache (bf16, batch=1 × 32 k × 36 layers × 8 heads × 128 × 2) | ~9.7 GB |
+| Buffers / scratch | ~5-8 GB |
+| **Total** | **~55-65 GB** of 96 GB |
+
+At 64 k context, push the same numbers up; expect ~85 GB peak. Should fit
+but close — drop to `gradient_accumulation_steps=4` if it OOMs.
+
+### Phase 1 (target 32 k) command sketch
+
+```bash
+# inside the cloned delta-mem-tests on Strix Halo
+export HSA_OVERRIDE_GFX_VERSION=11.5.1
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+# The published delta-mem repo doesn't ship a training script. Use the
+# delta-Mem submodule's training entry-point (see `delta-Mem/deltamem/training`).
+# Pseudocode skeleton:
+python -m deltamem.training.train_adapter \
+    --base-model Qwen/Qwen3-4B-Instruct-2507 \
+    --adapter-init declare-lab/delta-mem_qwen3_4b-instruct \
+    --dataset-mix data/longctx_mix_v1.jsonl \
+    --max-seq-len 32768 \
+    --output-dir checkpoints/longctx-v1-32k \
+    --bf16 --gradient-checkpointing \
+    --per-device-batch 1 --grad-accum 8 \
+    --lr 1e-4 --epochs 2
+```
+
+If the in-repo training script needs adapting (likely — the published
+adapter's training code may not match the submodule exactly), the simplest
+fallback is a `trl` `SFTTrainer` wrapper around the delta-mem
+`DeltaMemAttention` module with only the adapter parameters
+`requires_grad=True`. About 80-100 LOC.
+
+### Phase 2 (push to 64 k)
+
+If phase 1 hits ratio ≥ 1.20 on a 32 k held-out set, repeat the same
+recipe with `max_seq_len=65536` and the heavier InfBench tail of the data
+mix. Phase 1 first so you have a working checkpoint to fall back to.
+
+---
+
+## Adapter export → cross-deploy here
+
+### What to ship back
+
+A delta-mem adapter checkpoint is a directory like
+`declare-lab/delta-mem_qwen3_4b-instruct/`. Required files:
+
+```
+adapter_model.safetensors      # the trained weights
+adapter_config.json            # rank, alpha, target modules, etc.
+config.json                    # parent model reference
+tokenizer.json                 # (optional but easier to keep alongside)
+```
+
+Total size: a few hundred MB. Zip and copy via scp / rsync / cloud bucket.
+
+### Verify portability on Strix Halo before shipping
+
+```bash
+# Round-trip the adapter through a CPU load + bf16 save to strip any
+# accidental device tensors or ROCm-specific dtypes from the safetensors.
+python - <<'PY'
+import torch
+from safetensors.torch import load_file, save_file
+sd = load_file("checkpoints/longctx-v1-32k/adapter_model.safetensors")
+sd_clean = {k: v.detach().to("cpu").to(torch.bfloat16).contiguous() for k, v in sd.items()}
+save_file(sd_clean, "checkpoints/longctx-v1-32k/adapter_model.safetensors")
+print(f"clean: {len(sd_clean)} tensors, sizes ok")
+PY
+```
+
+### Drop onto this host
+
+```powershell
+# On this CUDA host (E:\Development\delta-mem-tests)
+# Place the adapter dir under .planning/adapters/ (gitignored data) — e.g.:
+#   .planning/adapters/delta-mem_longctx-v1-32k/
+
+# Re-point the eval to the local adapter dir
+$env:PYTHONIOENCODING='utf-8'
+$env:KV_CACHE_BACKEND='oscar'
+$env:KV_CACHE_BITS='2'
+$env:OSCAR_K_ROTATION_PATH='data\oscar\rotations\instruct_gpqa\k_rotation_qqt_r_h_pbr.pt'
+$env:OSCAR_V_ROTATION_PATH='data\oscar\rotations\instruct_gpqa\v_rotation_sst_r_h_pbr.pt'
+
+# locomo_eval reads adapter from EVAL_CONFIG["adapter"]; either edit
+# run/locomo_eval.py to point at the local dir or use the existing
+# --adapter-override flag if added (TODO if not present).
+.venv\Scripts\python.exe -m run.locomo_eval --kv-cache-backend oscar --kv-cache-bits 2 \
+    --max-conversations 1 --max-questions-per-conversation 10 \
+    --output-json outputs\longctx_v1_conv0_smoke.json
+```
+
+### Success criteria for the round-trip
+
+1. **Anchor preserved**: conv-26 / 10 q at 17 k context — `delta ≥ 0.34`,
+   `ratio ≥ 1.25` (i.e. doesn't lose what the published adapter already
+   does well).
+2. **Extension achieved**: conv-41 / 10 q at 25 k context — `delta ≥
+   0.30`, `ratio ≥ 1.20` (the published adapter scored 0.139 / 0.60 here).
+3. **Hard target**: synthetic conv-26 x2 at ~32 k — `delta ≥ 0.25`,
+   `ratio ≥ 1.10` (any positive ratio is a win at this length).
+
+If (1) fails, the training regressed the anchor; lower LR, increase the
+anchor share in the data mix.
+
+If (1) passes and (2) regresses to ratio < 1.0, the curriculum didn't
+transfer; push more LongMemEval data and re-train.
+
+---
+
+## Risks and mitigations
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|-----------|
+| ROCm Triton kernels fail to JIT for delta-mem scan | Medium | `DELTA_MEM_DISABLE_TRITON=1` falls back to eager-PyTorch path; 1.5× slower but correctness-equivalent |
+| FlashAttention-2 ROCm port unstable | Medium | Fall back to `attn_implementation="sdpa"` (default); training ~2× slower at 32 k+ |
+| Numerical drift between bf16 on ROCm and CUDA shifts adapter quality | Low | bf16 has a single IEEE definition; rounding mode is consistent. Use the round-trip clean-save step above to strip any device-bound state |
+| Long-context QA datasets don't match LoCoMo dialogue structure → adapter overfits to wrong distribution | Medium | The 50 / 30 / 20 mix anchors on LoCoMo; tune the ratio after eval (1) |
+| 96 GB cap actually applies to discrete vs unified differently | Low | Verify with `rocm-smi` early; if iGPU exposes less, scale `max_seq_len` down accordingly |
+| Strix Halo memory bandwidth (256 GB/s) makes training prohibitively slow | Known | Bandwidth-bound but feasible; estimate ~12-36 h per phase 1 epoch on a 10 k-sample mix. Plan for 2-7 days per phase, not hours |
+
+---
+
+## Cost / time comparison (to keep honest)
+
+| Option | Wall time per training run | $$ | Iteration cost |
+|--------|---------------------------|-----|----------------|
+| Strix Halo (owned) | 2-7 days | $2-3 k one-time | $0 per run after hardware |
+| Rented cloud H100 80 GB | 6-12 h | $2-4 / h → ~$50-200 / run | Per-run fees, faster turnaround |
+| Rented cloud A100 80 GB | 18-30 h | $1-2 / h → ~$30-100 / run | Per-run fees, mid speed |
+| H200 / B200 (cloud) | 4-8 h | $5-10 / h → ~$50-200 / run | Per-run fees, fastest |
+
+Break-even at ~15-30 runs depending on cloud SKU. If you expect to iterate
+adapter rank, data mix, curriculum, and context-length sweep across
+several configurations, Strix Halo wins on TCO.
+
+**Recommended first step before committing the hardware**: rent an H100
+for one day, run a 10 k-sample LongMemEval-only sanity training to confirm
+the data + recipe produces a ratio improvement at 25 k. If yes, then
+either continue on cloud or buy the box.
+
+---
+
+## What this host's role becomes
+
+After Strix Halo is set up:
+
+| Concern | Host (this box) | Strix Halo |
+|---------|-----------------|------------|
+| Training delta-mem | ❌ (insufficient VRAM) | ✅ |
+| Adapter evaluation on LoCoMo | ✅ | possible but not required |
+| OSCAR rotation calibration (3-phase) | ✅ already done | not needed unless distribution changes |
+| KV-cache backend development | ✅ | not relevant |
+| Inference / demo | ✅ | ✅ (but bandwidth-limited tokens/s) |
+
+This host stays the **eval gold-standard**: every adapter checkpoint
+shipped back gets validated here against the LoCoMo conv-0/10 q anchor
+before promotion.
+
+---
+
+## Open questions to settle before training starts
+
+1. **Adapter format compatibility.** The published `declare-lab` adapter
+   uses a specific delta-Mem config (rank, target modules, head fan-out).
+   Confirm the training entry-point reads it back identically before
+   spending hours on the first epoch. Run a 100-step dry-run, save, load
+   on this host, eval on conv-0/3 q (10 min). Iterate config until the
+   round-trip matches the published-adapter baseline within noise.
+
+2. **State-update-mode parity.** Delta-mem has multiple `state_update_mode`
+   options. Inference here uses the default. Training MUST match or the
+   trained corrections will look correct in training and wrong at
+   inference. Lock this on day one.
+
+3. **Triton kernel parity.** If `DELTA_MEM_DISABLE_TRITON=1` is needed on
+   ROCm, also run training with the eager path on CUDA once for a
+   100-step sanity comparison — confirms the gradient is identical
+   between eager and Triton (it should be) and rules out a silent bug
+   showing up only post-training.
+
+4. **Tokenizer pad-side.** delta-mem training is sensitive to whether the
+   tokenizer pads on left or right; the published adapter assumes
+   right-pad with `pad_token_id=eos_token_id`. Set the same way on Strix
+   Halo before any data is loaded.
+
+---
+
+## Continuation pointer
+
+When Strix Halo training is set up and a checkpoint is ready, drop a note
+in `.planning/.continue-here.md` pointing at:
+
+- The Strix Halo training session ID / commit on the trainer's branch
+- The local adapter dir path on this host
+- The conv-0/10 q anchor eval result with the new adapter
+- Next experiment: conv-41 / 10 q at 25 k
+
+The handoff back to this CUDA host is then mechanical — replace the
+`EVAL_CONFIG["adapter"]` path and re-run the existing v5 / v6c eval
+commands.

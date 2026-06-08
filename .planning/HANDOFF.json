@@ -1,68 +1,98 @@
 {
-  "version": "1.0",
-  "timestamp": "2026-05-29T00:00:00Z",
-  "context": "research",
+  "version": "1.1",
+  "timestamp": "2026-06-08T00:00:00Z",
+  "context": "paused-after-48h-sweep",
   "project": "delta-mem-tests",
   "status": "paused",
-  "last_commit": "9cd4ecc",
-  "current_milestone": "Tier 1 reproduction + KV-quantisation x delta-mem experiment ladder + OSCAR port",
-  "what_we_proved": [
-    {"experiment": "bf16 baseline (conv-0 full + conv-1+8)", "result": "ratio 0.99x weighted across 389 q vs paper 1.20x", "verdict": "OUT_OF_BAND/REGRESSION; likely adapter mismatch"},
-    {"experiment": "delta-only (conv-0, 152 q)", "result": "delta_only 0.1064 vs truncated_base 0.0591 = 1.80x lift; temporal questions 20x lift", "verdict": "delta-mem captures real compressed memory; ~30% of full-attention quality"},
-    {"experiment": "TurboQuant 4-bit (conv-0, 10 q)", "result": "base 0.3344 / delta 0.3342 vs bf16 0.2680/0.2680 same slice", "verdict": "quality preserved at 4-bit; ~73% memory saving; pure-python codebook is ~50 min/q vs bf16's 5 min/q"},
-    {"experiment": "HQQ 2-bit (conv-0, 10 q)", "result": "all scores 0.0000, outputs gibberish", "verdict": "naive 2-bit destroys attention; empirically validates need for OSCAR's spectral-rotation preconditioning"},
-    {"experiment": "OSCAR rotation correctness (apply_rotations on Qwen3-4B-Instruct-2507)", "result": "rotation-only output matches baseline byte-for-byte on the short smoke prompt; INT2 path same", "verdict": "rotation math is correct; Thinking-2507 rotations DO NOT obviously break Instruct-2507; INT2 middle region not yet exercised (prompt under sink_tokens=64)"}
+  "last_commit": "ab1257c",
+  "current_milestone": "OSCAR INT2 + delta-mem combo fully characterised on RTX 3060 12 GB. Quality ceiling at ~17-20 k context bounded by published adapter's training distribution. Pivoting to Strix Halo (96 GB ROCm) for long-context adapter fine-tuning; see STRIX_INSTRUCTIONS.md.",
+  "what_we_proved_this_session": [
+    {
+      "experiment": "v5 — clean reproduction (OSCAR INT2 + GPQA-rot + packing + cross-arm invalidation, conv-26/10q, 17 590 tokens)",
+      "result": "base 0.2735 / delta 0.3642 / ratio 1.332",
+      "verdict": "Production combo confirmed stable; ratio above paper's 1.20 by 11%."
+    },
+    {
+      "experiment": "v4a fresh — INT4 + GPQA-rot at 17 k (was: stale-JSON false-positive on prior attempt)",
+      "result": "base 0.2832 / delta 0.2000 (8/10 before OOM) / ratio 0.71",
+      "verdict": "INT4 is not a win on this stack. Base lifts (delta-mem's noisier-training-target gone), delta arm degrades. INT4 also requires 2x VRAM and OOM'd in delta arm."
+    },
+    {
+      "experiment": "v4b — INT4 + identity rotation",
+      "result": "both arms 0.0, degraded text loops",
+      "verdict": "Identity rotation is degenerate at INT4 (same failure class as INT2). Rotation is essential at any bit width."
+    },
+    {
+      "experiment": "port_debug test F — INT4 + GPQA-rot at 4 k context",
+      "result": "exact baseline match ('QM-7194-ZULU')",
+      "verdict": "OSCAR INT4 path is bit-correct; v4a's 17 k regression is a quality-vs-bit-width / delta-mem-interaction issue, not a port bug."
+    },
+    {
+      "experiment": "INT2 4-per-byte packing (submodule cd17cb3)",
+      "result": "Headline OSCAR 7.1x memory vs bf16 (was 2.0x). End-to-end ~2.1 GB freed.",
+      "verdict": "Took the 12 GB card from OOM-risky to comfortable headroom at 17 k."
+    },
+    {
+      "experiment": "v6c — context scaling on conv-41 (25 672 tokens, batch=1, shadow OFF)",
+      "result": "base 0.231 / delta 0.139 / ratio 0.602",
+      "verdict": "delta-mem's strength DOES NOT persist past ~17 k. At 25 k ratio inverts from 1.33 win to 0.60 loss. The binding constraint is the adapter's training distribution, not VRAM."
+    },
+    {
+      "experiment": "OSCAR_DISABLE_DEQUANT_SHADOW=1 env var (submodule 3835184) + --eval-batch-size 1 CLI flag",
+      "result": "Lets conv-41 (25 k) complete on 12 GB; v6 (default batch=2 + shadow ON) crashed in delta arm rebuild; v6b (shadow OFF + batch=2) crashed at delta q4; only v6c (both knobs) completed cleanly.",
+      "verdict": "Combined knobs push the VRAM ceiling to ~25 k. Higher would need CPU RAM offload of the shadow (out of scope here; quality already regressed)."
+    }
   ],
   "infrastructure_state": {
-    "repo": "E:\\Development\\delta-mem-tests (git, main branch, clean at 9cd4ecc)",
+    "repo": "E:\\Development\\delta-mem-tests (git, main branch, clean at ab1257c, 48 commits ahead of origin)",
     "vendored_submodule_delta_mem": "delta-Mem at pinned commit 98dc679572ef77d77b97485bf2f2b2aa810b74ba (unmodified on disk)",
-    "vendored_submodule_oscar": "third_party/oscar-transformers at 55760e2 (https://github.com/jamesburton/oscar-transformers, MIT)",
-    "venv": ".venv via uv; CUDA 12.1 torch 2.5.1; turboquant 0.2.0 + hqq 0.2.8.post1 + optimum-quanto 0.2.5 + oscar-transformers 0.0.2 (editable from submodule) all installed",
-    "windows_quirks": "MSVC env via env/vsenv.ps1; CUDA 13.1 needs -allow-unsupported-compiler for VS 2025; optimum-quanto is Linux-only (gemm_cuda.cu uses GCC __asm__)",
+    "vendored_submodule_oscar": "third_party/oscar-transformers at 3835184 (8 commits ahead of origin/main; packing + OSCAR_DISABLE_DEQUANT_SHADOW env var)",
+    "venv": ".venv via uv; CUDA 12.1 torch 2.5.1; turboquant 0.2.0 + hqq 0.2.8.post1 + optimum-quanto 0.2.5 + oscar-transformers 0.0.2 (editable from submodule) + triton-windows all installed",
     "hardware": "Native Windows 11, internal RTX 3060 12 GB (T5500 workstation)",
-    "rotations_cached_at": "data/oscar/rotations/_hf_cache/Qwen3-4B-Thinking-2507/seq20000_prompt83_group128/ (gitignored; re-fetch from huggingface.co/Zhongzhu/OSCAR-RotationZoo)"
+    "rotations_cached_at": "data/oscar/rotations/instruct_gpqa/ (GPQA-cal rotations computed via run/oscar_calibrate.py; not gitignored)"
   },
-  "in_process_patches": [
-    "_chunked_eval_runner.py: chunked-prefill of build_teacher_forced_snapshot (history_replay mode, inert in official_prompt)",
-    "_chunked_eval_runner.py: OOM-class normalisation wrapping _generate_prompt_chunk (inert in official_prompt)",
-    "_chunked_eval_runner.py: chunked prefill of generate_official_full_history_answer (replaces monolithic 17.6k-token model.generate that OOMs at 37 GB)",
-    "_chunked_eval_runner.py: per-conversation KV-cache reuse via Cache.crop(history_len) — disabled when KV_CACHE_BACKEND != bf16",
-    "_chunked_eval_runner.py: KV_CACHE_BACKEND env var (bf16|turboquant|quanto|hqq|oscar) + KV_CACHE_BITS",
-    "_chunked_eval_runner.py: oscar branch loads rotations + calls apply_rotations once per process (guarded by _OSCAR_ROTATIONS_BAKED flag)"
+  "new_code_surface_since_prior_handoff": [
+    {"path": "STRIX_INSTRUCTIONS.md", "purpose": "Strix Halo long-context delta-mem training handoff. Primary new doc."},
+    {"path": "run/build_context_sweep_data.py", "purpose": "Build custom LoCoMo data files (single conv or synthetic-extended) for VRAM-ceiling experiments."},
+    {"path": "run/oscar_port_debug.py", "purpose": "Added tests E (INT4 + identity, expected degraded) and F (INT4 + GPQA-rot, expected baseline match)."},
+    {"path": "run/oscar_port_debug_f_only.py", "purpose": "Isolated test F retry harness (used to confirm transient CUDA error was driver noise, not bug)."},
+    {"path": "run/locomo_eval.py", "purpose": "New --eval-batch-size CLI flag (default unchanged at 2; use 1 for VRAM-pinched long-context runs)."},
+    {"path": "third_party/oscar-transformers/oscar_transformers/quantize.py", "purpose": "Packs INT1/2/4 codes 8//bits-per-byte. unpacked_d field added to QuantizedBlock."},
+    {"path": "third_party/oscar-transformers/oscar_transformers/cache.py", "purpose": "OSCAR_DISABLE_DEQUANT_SHADOW=1 env var skips the bf16 shadow cache (saves ~2.45 GB at 17 k; costs ~24 min runtime per 10 q eval)."},
+    {"path": "third_party/oscar-transformers/tests/test_quantize.py", "purpose": "New tests for packed codes shape across all supported bit-widths + bit-correctness."},
+    {"path": "third_party/oscar-transformers/tests/test_cache.py", "purpose": "New test asserts shadow-disabled path produces bit-identical output to shadow-enabled."},
+    {"path": "report/tier1-summary.md Appendix D", "purpose": "Three new sub-sections appended: port_debug E+F findings, packing 7x win, context-scaling sweep (v5/v6/v6b/v6c)."},
+    {"path": "data/locomo_conv-41.json, data/locomo_conv-26_x2.json, data/locomo_conv-26_x3.json", "purpose": "Sweep data files (gitignored)."},
+    {"path": "data/oscar/rotations/identity_d128_L36/", "purpose": "Identity rotation .pt files for v4b run (gitignored)."}
   ],
-  "oscar_module_state": {
-    "repo_url": "https://github.com/jamesburton/oscar-transformers",
-    "license": "MIT (port); attribution to FutureMLS-Lab/OSCAR (algorithm, MIT) and Zhongzhu/OSCAR-RotationZoo (calibrated rotations, Apache-2.0) in NOTICE",
-    "commits": [
-      {"sha": "4d4b57a", "summary": "Initial skeleton: rotation, quantize, cache modules + 12 unit tests"},
-      {"sha": "55760e2", "summary": "Replace bake_rotations with apply_rotations to handle Qwen3 QK Norm + RoPE"}
-    ],
-    "tests": "13 unit tests, all pass on transformers 5.9.0. The key one is test_apply_rotations_preserves_qwen3_block_output, which exercises a real Qwen3Attention block with q_norm/k_norm/RoPE/GQA and verifies orthogonal invariance to atol=1e-4 at fp32.",
-    "smoke_result": "All three of baseline / rotation-only / OSCAR-INT2 produce 'The capital of France is Paris.' Caveat: ~30-token prompt is below sink_tokens=64 so the INT2 middle region was never populated; rotation math is validated, INT2 middle-region quality is not."
+  "data_artifacts_this_session_gitignored": [
+    "outputs/oscar_int2_gpqacal_v5_conv0_smoke.json — v5 anchor (17 k, ratio 1.33)",
+    "outputs/oscar_int4_identity_conv0_smoke.json — v4b (INT4 + identity, both arms 0.0)",
+    "outputs/oscar_int4_gpqacal_conv0_smoke.STALE.json — stale; do not trust",
+    "outputs/oscar_int2_v6_conv41_22k.* — v6 partial (crashed in delta arm rebuild)",
+    "outputs/oscar_int2_v6b_conv41_noshadow.* — v6b partial (4/10 delta scored)",
+    "outputs/oscar_int2_v6c_conv41_bs1_noshadow.json — v6c full 10+10 (25 k, ratio 0.60)"
+  ],
+  "next_planned_phase": {
+    "name": "Long-context delta-mem adapter training on Strix Halo",
+    "rationale": "Quality ceiling at ~17 k is set by the published adapter's training distribution. Memory tricks alone can't move it. Strix Halo's 96 GB unified VRAM is enough for 32-64 k fine-tuning of Qwen3-4B + delta-mem adapter with gradient checkpointing.",
+    "primary_doc": "STRIX_INSTRUCTIONS.md",
+    "first_milestone": "Software-stack sanity: ROCm-PyTorch loads Qwen3-4B-Instruct-2507 + published adapter on Strix Halo and matches CUDA outputs on a 1 k-token smoke prompt.",
+    "phase_1_target": "32 k context fine-tune from published adapter; success = ratio >= 1.20 at conv-41/10 q on this host.",
+    "phase_2_target": "64 k context further fine-tune; success = ratio >= 1.10 at synthetic conv-26_x2."
   },
-  "next_planned_experiment": {
-    "name": "OSCAR conv-0/10q",
-    "rationale": "Same slice as TQ4 (Appendix B) and HQQ2 (Appendix C) baselines; produces the cross-method comparison that justified the OSCAR port in the first place.",
-    "preconditions_met": ["OSCARCache + apply_rotations built and unit-tested", "KV_CACHE_BACKEND=oscar wired into runner", "Thinking-2507 rotations downloaded and shape-confirmed for Instruct-2507", "Short-prompt smoke produces coherent output"],
-    "preconditions_open": ["Long-prompt smoke (~1k tokens) to exercise INT2 middle region before the 4-hour LoCoMo run — optional but cheap insurance"],
-    "command_sketch": "PowerShell: $env:KV_CACHE_BACKEND='oscar'; $env:OSCAR_K_ROTATION_PATH='data/oscar/rotations/_hf_cache/.../k_rotation_qqt_r_h_pbr.pt'; $env:OSCAR_V_ROTATION_PATH='.../v_rotation_sst_r_h_pbr.pt'; then the standard locomo_eval invocation for conv-0 first 10 q with both branches",
-    "contingency": "If conv-0/10q quality regresses badly under OSCAR, the Thinking rotations did not transfer to Instruct. Plan B: run the 3-phase OSCAR calibration on Instruct (dump Q/K/V activations, run compute_kv_rotation.py, save new rotations). This step is expensive and Windows-unfriendly because upstream uses sglang for the dump phase; may need WSL or a Linux box."
-  },
-  "blockers": [
-    {"description": "OSCAR ships only as SGLang patches, not a transformers library. Port required.", "type": "engineering", "status": "RESOLVED — see third_party/oscar-transformers."},
-    {"description": "RotationZoo on HF has Qwen3-4B-Thinking-2507 but not Qwen3-4B-Instruct-2507. We use the Instruct variant.", "type": "data", "status": "DEFERRED — using Thinking rotations as a transfer-test on Instruct. If conv-0/10q quality regresses, fall back to running our own calibration."},
-    {"description": "optimum-quanto's CUDA extension uses GCC __asm__ inline assembly; doesn't compile on MSVC.", "type": "technical", "status": "ACCEPTED — skip optimum-quanto on Windows; HQQ remains available."},
-    {"description": "Qwen3's QK Norm + RoPE break naive weight-baking of rotations.", "type": "math", "status": "RESOLVED — replaced bake_rotations with attention-forward monkey-patch apply_rotations. See submodule commit 55760e2."}
+  "open_followups_not_blocking_strix_pivot": [
+    {"item": "CPU RAM offload of dequant shadow", "value": "Push 12 GB VRAM ceiling from ~25 k to ~30 k. Useful only after longer-context adapter exists."},
+    {"item": "Default eval_batch_size to 1 for OSCAR backend", "value": "Prevents first-try OOMs at >22 k context. Minor ergonomics."},
+    {"item": "Add --adapter-override CLI flag to locomo_eval.py", "value": "Simplifies the round-trip from Strix Halo without editing EVAL_CONFIG. ~20 LOC."}
   ],
-  "human_actions_pending": [
-    {"action": "Decide whether to run a longer-prompt smoke (~1k tokens) before the LoCoMo eval, or skip straight to conv-0/10q", "context": "User picked 'pause cleanly' at the natural stopping point; either choice is reasonable in a fresh session", "blocking": false}
-  ],
-  "decisions_made_in_this_session": [
-    {"decision": "Spin out OSCAR port as a new public repo (jamesburton/oscar-transformers, MIT) and vendor as submodule", "rationale": "Reusable artefact; doesn't entangle with delta-mem-tests lifecycle"},
-    {"decision": "Use the weight-baking design FIRST (later corrected)", "rationale": "Initial preference (matched OSCAR's design intent in sglang); the failure case validated against a stub block. Lesson: always test against the real attention module, not a stub."},
-    {"decision": "Pivot to attention-forward monkey-patching after empirical failure on the real model", "rationale": "QK Norm γ + RoPE both non-commutative with rotation. The patched-forward approach is mathematically correct and validated by the new end-to-end Qwen3Attention test."},
-    {"decision": "Try Thinking-2507 rotations on Instruct-2507 first as a transfer test", "rationale": "Rotations are calibrated offline and somewhat task-agnostic; same architecture; cheaper than the 3-phase calibration on a Windows host. Short-prompt smoke gave the early green light."}
+  "hard_earned_lessons_do_not_forget": [
+    "locomo_eval.py reuses existing output JSONs if present; always rename to *.STALE.json before relaunching.",
+    "Cross-arm cache invalidation is required between base and delta arms for non-bf16 KV backends (wired in commit 35612a4).",
+    "OSCAR_K_ROTATION_PATH and OSCAR_V_ROTATION_PATH env vars are mandatory whenever KV_CACHE_BACKEND=oscar.",
+    "Transient CUDA 'unknown error' crashes on this driver are nuisance noise after long runs; re-run usually fixes them. Not a code bug.",
+    "INT4 OSCAR is NOT a quality upgrade over INT2 in this stack. INT4 base improves but delta-mem corrections were calibrated against INT2's noise floor."
   ],
   "uncommitted_files": [],
-  "next_action": "Either (A) run a ~1k-token smoke to exercise INT2 middle region, or (B) kick off conv-0/10q OSCAR run. See .continue-here.md for the exact PowerShell incantation."
+  "next_action": "Begin Strix Halo setup per STRIX_INSTRUCTIONS.md. First concrete step: verify ROCm 6.2+ install on the Strix Halo box and run the sanity-check script in section 'Software stack > Sanity check before training'."
 }
