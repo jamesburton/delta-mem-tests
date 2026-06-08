@@ -122,6 +122,67 @@ print('model on', m.device, 'mem:', torch.cuda.memory_allocated() / 2**30, 'GB')
 "
 ```
 
+### Run the training pipeline smoke (REQUIRED before real training)
+
+After cloning, run `run/training_smoke.py` on the Strix Halo box to
+validate the training pipeline end-to-end at a tiny context length.
+The same script was used on this CUDA host to de-risk the recipe — it
+caught real bugs that would have wasted Strix Halo hours.
+
+```bash
+python -m run.training_smoke           # 256-token smoke (6 checks)
+python -m run.training_smoke --probe   # also sweeps max-fit context
+```
+
+Findings from the local smoke run that apply to Strix Halo too:
+
+1. **delta-mem adapter is 4.9 M trainable params (252 tensors)**, not the
+   ~50 M I had estimated. Backbone freezes to 4.02 B params correctly.
+2. **`gradient_checkpointing_enable(..., use_reentrant=True)` is REQUIRED.**
+   The default `use_reentrant=False` fails after the first iteration
+   because delta-mem's Triton scan kernel (`affine_scan.py`) saves
+   tensors in a way that's incompatible with non-reentrant checkpointing.
+   No checkpoint at all *also* fails on the second iteration for the
+   same reason. The legacy reentrant path is the only working option.
+3. **Local 12 GB ceiling under reentrant checkpointing: ~2048 tokens** —
+   useful for pipeline smoke runs and hyperparameter scouts, far below
+   the 32-64 k training target that requires Strix Halo.
+4. **Peak memory at 256 tokens (no checkpointing): 10.05 GB** — leaves
+   1.95 GB headroom. At 2048 with checkpointing: 13.2 GB (Windows
+   paging into shared memory; would be a hard OOM on Linux without
+   swap).
+5. **Adapter save/load round-trips bit-identically** across 324 tensors
+   (252 trainable + 72 buffers). Cross-platform deployment of the
+   trained adapter back to this CUDA host should be mechanical.
+
+### CRITICAL training-config requirement
+
+When wiring `transformers.Trainer` (or any custom training loop) on
+Strix Halo, set:
+
+```python
+TrainingArguments(
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": True},  # <- non-negotiable
+    ...
+)
+```
+
+Or equivalently:
+
+```python
+model.gradient_checkpointing_enable(
+    gradient_checkpointing_kwargs={"use_reentrant": True}
+)
+```
+
+Without `use_reentrant=True` the training crashes on the second forward
+pass with `RuntimeError: Trying to backward through the graph a second
+time (or directly access saved tensors after they have already been
+freed)` originating in
+`deltamem/kernels/affine_scan.py:378`. This is a real blocker, not a
+warning to ignore.
+
 ---
 
 ## Training plan
@@ -169,6 +230,7 @@ TRAIN = dict(
     weight_decay = 0.01,
     bf16 = True,
     gradient_checkpointing = True,  # required at 32 k+ on 96 GB
+    gradient_checkpointing_kwargs = {"use_reentrant": True},  # REQUIRED — see smoke findings
     optim = "adamw_torch_fused",
     eval_steps = 500,
     save_steps = 1000,
