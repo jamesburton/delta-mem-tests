@@ -5,6 +5,11 @@
 **Scope:** Option 3 in `LONG_CONTEXT_PLAN.md` — adding Gemma 3n E4B as a third
 supported backbone alongside Qwen3 and SmolLM3.
 
+**Companion doc:** `.planning/research/gemma3n-implementation-plan.md` —
+"if we ever decide to do it, here's exactly how" (5-phase execution plan
+with file paths, LOC, risk register, and a revised recommendation that
+takes the April 2026 Gemma 4 release into account).
+
 ---
 
 ## TL;DR
