@@ -538,3 +538,49 @@ rather than the doc's 3-4.
      no delta-mem — pure EpiCache).
    - C. (already have from v6c) delta-mem + OSCAR INT2 at 25 k.
    Exit criterion: does B's delta score at 25 k beat C's 0.139?
+
+### Update — NF4 + bf16 KV at 25 k (conv-41) — DELTA-MEM RECOVERS
+
+Ran NF4 + bf16 KV + delta-mem at conv-41 (25 k context) to validate
+the production base-only path proposed by the 17 k NF4 result.
+Surprising and positive:
+
+| Run | Context | base | delta | ratio |
+|-----|---------|------|-------|-------|
+| v5 (bf16+OSCAR+delta) | 17 k | 0.274 | 0.364 | 1.332 |
+| NF4+bf16 KV+delta | 17 k | 0.379 | 0.296 | 0.782 |
+| **NF4+bf16 KV+delta** | **25 k** | **0.309** | **0.320** | **1.036** |
+| v6c (OSCAR+delta) | 25 k | 0.231 | 0.139 | 0.602 |
+
+**Delta-mem recovers the winning regime at 25 k under NF4+bf16 KV**
+(ratio 1.036). This is a 2.3× improvement on the delta arm vs v6c
+(0.320 vs 0.139) without any retraining — bypassing OSCAR's
+quantization noise lets delta-mem's corrections work again at the
+longer context.
+
+Multi-hop at 25 k: delta 0.398 vs base 0.376 (+0.022 lift) — delta
+helps modestly. Temporal arm: identical 0.303 either side. Open-domain
+sample too small (n=1) to compare.
+
+Production ladder (no retraining required):
+
+| Context | Best config | Ratio | Status |
+|---------|-------------|-------|--------|
+| ≤17 k | v5 (bf16+OSCAR+delta) | 1.33 | shipped |
+| ~25 k | NF4+bf16 KV+delta | 1.036 | **shipped** (this result) |
+| 32 k | NF4+bf16 KV+delta | ? | needs synthetic test |
+| 64 k+ | EpiCache pilot OR adapter retrain | — | queued |
+
+Significant implication: the urgency of the Strix adapter retrain
+(Option 1) drops moderately because we now have a working delta-mem
+path at 25 k. The retrain is still needed to push delta-winning beyond
+where NF4+bf16 KV taps out (likely 32-40 k).
+
+Test command for reproducing this result:
+```powershell
+$env:QUANTIZE_BACKBONE_INT4='1'
+.venv\Scripts\python.exe -m run.locomo_eval --quantize-backbone-int4 `
+    --max-conversations 1 --max-questions-per-conversation 10 `
+    --eval-batch-size 1 --data-file data\locomo_conv-41.json `
+    --output-json outputs\nf4_bf16kv_conv41_25k.json
+```
