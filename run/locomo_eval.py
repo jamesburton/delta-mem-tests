@@ -121,15 +121,19 @@ TOLERANCE = 0.05
 
 
 def _resolve_adapter_path() -> str:
-    """Resolve the HF repo ID to a local snapshot path.
+    """Resolve the HF repo ID (or local override path) to a local snapshot path.
 
     The released delta-mem adapter must be loaded from a local directory
     (confirmed in Task 4: delta_impl.py:493-497, :2794-2802 accept paths only).
     The vendored eval uses local_files_only=True (locomo_delta.py:112, 118), so
     the adapter must already be present in the HF cache.
-    """
-    from huggingface_hub import snapshot_download
 
+    If ``--adapter-override <path>`` was passed, EVAL_CONFIG["adapter"] now
+    holds an absolute local path; return it directly (skip snapshot_download).
+    """
+    if EVAL_CONFIG.get("adapter_override"):
+        return EVAL_CONFIG["adapter"]
+    from huggingface_hub import snapshot_download
     return snapshot_download(EVAL_CONFIG["adapter"])
 
 
@@ -319,9 +323,23 @@ def main() -> int:
              "halve attention scratch memory for VRAM-constrained long-context "
              "runs at the cost of ~2x wall-time.",
     )
+    parser.add_argument(
+        "--adapter-override",
+        default=None,
+        help="Local path to a delta-mem adapter directory (containing "
+             "delta_mem_config.json + delta_mem_adapter.pt). Skips the "
+             "HF snapshot_download of the released adapter. Use this to "
+             "evaluate a locally-trained or Strix-Halo-trained checkpoint.",
+    )
     args = parser.parse_args()
     if args.eval_batch_size > 0:
         EVAL_CONFIG["eval_batch_size"] = args.eval_batch_size
+    if args.adapter_override:
+        override_path = Path(args.adapter_override).resolve()
+        if not override_path.is_dir():
+            raise SystemExit(f"--adapter-override path is not a directory: {override_path}")
+        EVAL_CONFIG["adapter"] = str(override_path)
+        EVAL_CONFIG["adapter_override"] = True
     # Backwards compat: --turboquant-bits implies --kv-cache-backend turboquant.
     if args.turboquant_bits > 0 and args.kv_cache_backend == "bf16":
         args.kv_cache_backend = "turboquant"
