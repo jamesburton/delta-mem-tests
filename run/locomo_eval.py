@@ -147,6 +147,7 @@ def _invoke_vendored_eval(
     data_file: Optional[str] = None,
     kv_cache_backend: str = "bf16",
     kv_cache_bits: int = 0,
+    quantize_backbone_int4: bool = False,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -192,6 +193,15 @@ def _invoke_vendored_eval(
             f"  KV_CACHE_BACKEND={kv_cache_backend} "
             f"KV_CACHE_BITS={kv_cache_bits or '(backend-default)'} "
             "(KV cache quantised; cross-question cache reuse disabled)"
+        )
+    if quantize_backbone_int4:
+        # Toggle NF4 backbone weight quantization in the chunked runner.
+        # See run/_chunked_eval_runner.py for the AutoModelForCausalLM
+        # from_pretrained monkeypatch that consumes this env var.
+        subprocess_env["QUANTIZE_BACKBONE_INT4"] = "1"
+        print(
+            "  QUANTIZE_BACKBONE_INT4=1 "
+            "(NF4 bnb weights + bf16 compute; KV-backend independent)"
         )
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(
@@ -331,6 +341,18 @@ def main() -> int:
              "HF snapshot_download of the released adapter. Use this to "
              "evaluate a locally-trained or Strix-Halo-trained checkpoint.",
     )
+    parser.add_argument(
+        "--quantize-backbone-int4",
+        action="store_true",
+        default=False,
+        help="Load the base backbone with bitsandbytes NF4 4-bit weight "
+             "quantization (bf16 compute, double-quant). Frees ~5-6 GB of "
+             "weight VRAM, enabling much longer contexts on a 12 GB card. "
+             "Adapter remains bf16 (QLoRA-style overlay). UNTESTED in "
+             "combination with OSCAR INT2 KV: the OSCAR rotations were "
+             "calibrated against bf16 weights, so a small quality cost is "
+             "possible. See LONG_CONTEXT_PLAN.md Option 4 for details.",
+    )
     args = parser.parse_args()
     if args.eval_batch_size > 0:
         EVAL_CONFIG["eval_batch_size"] = args.eval_batch_size
@@ -372,6 +394,7 @@ def main() -> int:
         data_file=args.data_file,
         kv_cache_backend=args.kv_cache_backend,
         kv_cache_bits=args.kv_cache_bits,
+        quantize_backbone_int4=args.quantize_backbone_int4,
     )
 
     if args.kv_cache_backend != "bf16":
@@ -383,6 +406,10 @@ def main() -> int:
             f"{args.kv_cache_backend} {EVAL_CONFIG['kv_cache_bits']}-bit "
             "(residual-window kept in original precision; "
             "cross-question reuse disabled)"
+        )
+    if args.quantize_backbone_int4:
+        EVAL_CONFIG["backbone_quantization"] = (
+            "nf4 (bnb 4-bit weights, bf16 compute, double-quant)"
         )
     dm, fz, skipped = _extract_ratios(scores_path)
 
