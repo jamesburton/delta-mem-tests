@@ -1,98 +1,104 @@
 {
-  "version": "1.1",
-  "timestamp": "2026-06-08T00:00:00Z",
-  "context": "paused-after-48h-sweep",
+  "version": "1.2",
+  "timestamp": "2026-06-09T22:00:00Z",
+  "context": "paused-mid-orchestration",
   "project": "delta-mem-tests",
   "status": "paused",
-  "last_commit": "ab1257c",
-  "current_milestone": "OSCAR INT2 + delta-mem combo fully characterised on RTX 3060 12 GB. Quality ceiling at ~17-20 k context bounded by published adapter's training distribution. Pivoting to Strix Halo (96 GB ROCm) for long-context adapter fine-tuning; see STRIX_INSTRUCTIONS.md.",
+  "last_commit": "0b06276",
+  "current_milestone": "Long-context exploration: NF4+bf16 KV path validated as production-ready for 17-32k base-only inference; Strix Halo fully setup for adapter retrain (6th coordinator attempt should land training); EpiCache pilot scaffolded for 64k+ work; Gemma 3n SKIP PERMANENTLY per implementation plan; SmolLM3 OSCAR unblocked.",
   "what_we_proved_this_session": [
     {
-      "experiment": "v5 — clean reproduction (OSCAR INT2 + GPQA-rot + packing + cross-arm invalidation, conv-26/10q, 17 590 tokens)",
-      "result": "base 0.2735 / delta 0.3642 / ratio 1.332",
-      "verdict": "Production combo confirmed stable; ratio above paper's 1.20 by 11%."
+      "experiment": "NF4 backbone weights + OSCAR INT2 KV + GPQA-rot + delta-mem (conv-26 / 10q at 17.5k)",
+      "result": "base 0.0000 (gibberish), delta 0.1455 (real but degraded), ratio undefined",
+      "verdict": "Two compressions compound: OSCAR rotations calibrated on bf16 stats can't survive NF4 perturbation. Delta-mem rescues the model to coherent text — research-interesting finding that adapter carries enough semantic info to mask broken base attention. NOT production-usable."
     },
     {
-      "experiment": "v4a fresh — INT4 + GPQA-rot at 17 k (was: stale-JSON false-positive on prior attempt)",
-      "result": "base 0.2832 / delta 0.2000 (8/10 before OOM) / ratio 0.71",
-      "verdict": "INT4 is not a win on this stack. Base lifts (delta-mem's noisier-training-target gone), delta arm degrades. INT4 also requires 2x VRAM and OOM'd in delta arm."
+      "experiment": "NF4 backbone weights + bf16 KV (no OSCAR) + delta-mem (conv-26 / 10q at 17.5k)",
+      "result": "base 0.3788 (+38% vs v5), delta 0.2962 (-19% vs v5), ratio 0.782",
+      "verdict": "Base arm IMPROVES (OSCAR's INT2 cost on un-corrected arm was hurting). Delta arm degrades — multi-hop questions collapse (0.667 -> 0.095). Ratio inverts: BASE beats delta. Production NF4 path for 17-32k base-only inference unlocked, no training required."
     },
     {
-      "experiment": "v4b — INT4 + identity rotation",
-      "result": "both arms 0.0, degraded text loops",
-      "verdict": "Identity rotation is degenerate at INT4 (same failure class as INT2). Rotation is essential at any bit width."
+      "experiment": "Gemma 3n E4B implementation plan (research)",
+      "result": "5-phase plan, ~1255 LOC, ~4 weeks, $400-650 cloud cost. SKIP PERMANENTLY recommendation: Gemma 4 E4B shipped April 2026 with 128k native context, dropped AltUp+Laurel (2 of 3 blocking risks resolved upstream).",
+      "verdict": "Plan portable to Gemma 4 if needed; main repo recommendation is to use Gemma 4 native context directly when a multimodal long-context workload materializes."
     },
     {
-      "experiment": "port_debug test F — INT4 + GPQA-rot at 4 k context",
-      "result": "exact baseline match ('QM-7194-ZULU')",
-      "verdict": "OSCAR INT4 path is bit-correct; v4a's 17 k regression is a quality-vs-bit-width / delta-mem-interaction issue, not a port bug."
+      "experiment": "EpiCache + LoCoCo alternatives evaluation (research)",
+      "result": "EpiCache VIABLE (Apple, MIT, ICML 2026, training-free, native LoCoMo eval, ~50 LOC from Qwen3-4B). LoCoCo RULED OUT (dead repo, Llama-2-7B only, no GQA). Day-2 budget revised 3-4 -> 5-7 engineer-days after Day-1 agent discovered EpiCache is a parallel inference pipeline not a Cache subclass.",
+      "verdict": "Pilot worth running, but now sharpened to 64k+ context use case OR quality booster at 25-32k where delta-mem regresses. Day-1 scaffold landed (submodule + Qwen3 adapter + CLI + CPU smoke); Day 2 wiring placeholder raises NotImplementedError."
     },
     {
-      "experiment": "INT2 4-per-byte packing (submodule cd17cb3)",
-      "result": "Headline OSCAR 7.1x memory vs bf16 (was 2.0x). End-to-end ~2.1 GB freed.",
-      "verdict": "Took the 12 GB card from OOM-risky to comfortable headroom at 17 k."
+      "experiment": "SmolLM3 OSCAR rotation support (submodule patch)",
+      "result": "_build_patched_forward dispatched into per-class builders (Qwen3 unchanged bit-identical; new SmolLM3 variant honours per-layer use_rope, no q_norm/k_norm). 19/19 submodule tests pass. Logits round-trip 4.17e-7 max error.",
+      "verdict": "SmolLM3 OSCAR calibration is end-to-end runnable now. Sliding-window attention layers still untested (out of scope this session)."
     },
     {
-      "experiment": "v6c — context scaling on conv-41 (25 672 tokens, batch=1, shadow OFF)",
-      "result": "base 0.231 / delta 0.139 / ratio 0.602",
-      "verdict": "delta-mem's strength DOES NOT persist past ~17 k. At 25 k ratio inverts from 1.33 win to 0.60 loss. The binding constraint is the adapter's training distribution, not VRAM."
-    },
-    {
-      "experiment": "OSCAR_DISABLE_DEQUANT_SHADOW=1 env var (submodule 3835184) + --eval-batch-size 1 CLI flag",
-      "result": "Lets conv-41 (25 k) complete on 12 GB; v6 (default batch=2 + shadow ON) crashed in delta arm rebuild; v6b (shadow OFF + batch=2) crashed at delta q4; only v6c (both knobs) completed cleanly.",
-      "verdict": "Combined knobs push the VRAM ceiling to ~25 k. Higher would need CPU RAM offload of the shadow (out of scope here; quality already regressed)."
+      "experiment": "Strix Halo coordinator (5 attempts)",
+      "result": "Attempt 1 aborted: SSH unset. Attempt 2 aborted: discovered ssh strix lands on Windows cmd.exe, NOT Linux (WSL assumption wrong). Attempt 3 reconnoitred: Python 3.12.10 + .venv with torch 2.11.0+rocm7.13.0 working, repo at C:\\Development\\delta-mem-tests, GPU verified. Found stale run/ and delta-Mem/ dirs. Attempts 4-5 hit: rsync install failed (Scoop manifest gone), scp dir-nesting bug (patched 54a5a54 via /. trailing-merge), PS ExecutionPolicy on -File (patched same commit), nested delta-Mem/delta-Mem/ (deleted by agent #5), Triton bf16 affine-scan llvm::isUIntN assertion on gfx1151 (patched 0b06276 via DELTA_MEM_SCAN_IMPL=torch + use python.exe direct).",
+      "verdict": "All 8 blockers fixed. 6th attempt should land training cleanly. Strix Python 3.12 venv + torch ROCm 7.13.0 verified working; rocm-smi not present (use torch probe as GPU gate)."
     }
   ],
   "infrastructure_state": {
-    "repo": "E:\\Development\\delta-mem-tests (git, main branch, clean at ab1257c, 48 commits ahead of origin)",
-    "vendored_submodule_delta_mem": "delta-Mem at pinned commit 98dc679572ef77d77b97485bf2f2b2aa810b74ba (unmodified on disk)",
-    "vendored_submodule_oscar": "third_party/oscar-transformers at 3835184 (8 commits ahead of origin/main; packing + OSCAR_DISABLE_DEQUANT_SHADOW env var)",
-    "venv": ".venv via uv; CUDA 12.1 torch 2.5.1; turboquant 0.2.0 + hqq 0.2.8.post1 + optimum-quanto 0.2.5 + oscar-transformers 0.0.2 (editable from submodule) + triton-windows all installed",
-    "hardware": "Native Windows 11, internal RTX 3060 12 GB (T5500 workstation)",
-    "rotations_cached_at": "data/oscar/rotations/instruct_gpqa/ (GPQA-cal rotations computed via run/oscar_calibrate.py; not gitignored)"
+    "local_repo": "E:\\Development\\delta-mem-tests on main at 0b06276, clean, pushed to origin/main.",
+    "local_venv": ".venv via uv; Python 3.11; CUDA 12.1 torch 2.5.1; turboquant + hqq + optimum-quanto + oscar-transformers + bitsandbytes (NEW 0.49.2 for NF4) + triton-windows installed.",
+    "local_hardware": "Native Windows 11, internal RTX 3060 12 GB.",
+    "strix_repo": "C:\\Development\\delta-mem-tests on Strix Halo box. delta-Mem submodule at 5cd5d91 (synced to origin/main). run/ renamed to run.old; current main copied via scp-merge.",
+    "strix_venv": ".venv with Python 3.12.10 + torch 2.11.0+rocm7.13.0. ROCm-on-Windows 7.1 at C:\\Program Files\\AMD\\ROCm\\7.1. GPU verified via torch.cuda.is_available()=True.",
+    "submodule_oscar_transformers": "at SmolLM3-rotation-support tip (3ce9b62) — merged to main.",
+    "submodule_ml_epicache": "at b742661 (Apple ml-epicache public release 2025-10-02).",
+    "submodule_delta_mem": "at 98dc679... (unchanged on local; updated to 5cd5d91 on Strix during 5th attempt)."
   },
   "new_code_surface_since_prior_handoff": [
-    {"path": "STRIX_INSTRUCTIONS.md", "purpose": "Strix Halo long-context delta-mem training handoff. Primary new doc."},
-    {"path": "run/build_context_sweep_data.py", "purpose": "Build custom LoCoMo data files (single conv or synthetic-extended) for VRAM-ceiling experiments."},
-    {"path": "run/oscar_port_debug.py", "purpose": "Added tests E (INT4 + identity, expected degraded) and F (INT4 + GPQA-rot, expected baseline match)."},
-    {"path": "run/oscar_port_debug_f_only.py", "purpose": "Isolated test F retry harness (used to confirm transient CUDA error was driver noise, not bug)."},
-    {"path": "run/locomo_eval.py", "purpose": "New --eval-batch-size CLI flag (default unchanged at 2; use 1 for VRAM-pinched long-context runs)."},
-    {"path": "third_party/oscar-transformers/oscar_transformers/quantize.py", "purpose": "Packs INT1/2/4 codes 8//bits-per-byte. unpacked_d field added to QuantizedBlock."},
-    {"path": "third_party/oscar-transformers/oscar_transformers/cache.py", "purpose": "OSCAR_DISABLE_DEQUANT_SHADOW=1 env var skips the bf16 shadow cache (saves ~2.45 GB at 17 k; costs ~24 min runtime per 10 q eval)."},
-    {"path": "third_party/oscar-transformers/tests/test_quantize.py", "purpose": "New tests for packed codes shape across all supported bit-widths + bit-correctness."},
-    {"path": "third_party/oscar-transformers/tests/test_cache.py", "purpose": "New test asserts shadow-disabled path produces bit-identical output to shadow-enabled."},
-    {"path": "report/tier1-summary.md Appendix D", "purpose": "Three new sub-sections appended: port_debug E+F findings, packing 7x win, context-scaling sweep (v5/v6/v6b/v6c)."},
-    {"path": "data/locomo_conv-41.json, data/locomo_conv-26_x2.json, data/locomo_conv-26_x3.json", "purpose": "Sweep data files (gitignored)."},
-    {"path": "data/oscar/rotations/identity_d128_L36/", "purpose": "Identity rotation .pt files for v4b run (gitignored)."}
+    {"path": "run/nf4_smoke.py", "purpose": "NF4 wiring + bnb dequant-on-read smoke (~240 LOC); used to validate the NF4 path before full eval."},
+    {"path": "run/locomo_eval.py", "purpose": "Three new CLI flags: --quantize-backbone-int4, --model-override, --epicache-budget/n-clusters/etc."},
+    {"path": "run/_chunked_eval_runner.py", "purpose": "NF4 monkey-patches eval_mod.load_base_model with BitsAndBytesConfig + 2 delta-mem QLoRA-compat fixes (Params4bit slice + uint8 dtype rejection). EpiCache backend dispatch raises NotImplementedError pending Day 2."},
+    {"path": "run/training_smoke.py", "purpose": "Locks DELTA_MEM_SCAN_IMPL=torch at module top before any deltamem import (fixes Triton bf16 affine-scan crash on Strix gfx1151)."},
+    {"path": "run/SMOLLM3_NOTES.md, run/oscar_calibrate_smollm3.py, run/smollm3_smoke.py, run/epicache_smoke.py, run/epicache_qwen3_adapter.py", "purpose": "SmolLM3 + EpiCache scaffolds (CPU smoke for both passes)."},
+    {"path": "strix/{prepare_data.py, train_phase1.py, verify_checkpoint.py, train_smollm3_phase1.py, run_phase1.sh, run_phase1.ps1, test_runner_paths.ps1, README.md, __init__.py}", "purpose": "Strix Halo training infra. PowerShell .ps1 files are the Windows-on-Strix variants; .sh kept for the dual-boot Linux case."},
+    {"path": "tools/{strix_ssh.py, STRIX_SSH_USAGE.md, __init__.py}", "purpose": "SSH coordination helper with STRIX_SHELL=cmd|powershell|bash; native Windows OpenSSH; rocm-smi + nvidia-smi GPU probes; scp /. trailing-merge fallback; PowerShell Get-Content -Wait tail-log."},
+    {"path": "kaggle/{KAGGLE_INSTRUCTIONS.md, notebook_t4.ipynb, deepspeed_zero3_config.json}", "purpose": "Kaggle T4 16 GB notebook + T4 x2 ZeRO-3 config for adapter fine-tuning."},
+    {"path": "LONG_CONTEXT_PLAN.md", "purpose": "4-option ladder + measured-result update sections (NF4+OSCAR collapse, NF4+bf16 KV win, EpiCache Day-2 readiness checklist)."},
+    {"path": "STRIX_INSTRUCTIONS.md", "purpose": "Added 146-LOC 'Windows-on-Strix variant' section with PowerShell software stack, Start-Process tmux replacement, ROCm-Windows install pointers."},
+    {"path": ".planning/research/{gemma3n-deltamem-feasibility.md, gemma3n-implementation-plan.md, long-context-alternatives.md}", "purpose": "Gemma research (DEFER -> SKIP) + EpiCache/LoCoCo evaluation (pilot EpiCache, skip LoCoCo)."},
+    {"path": "third_party/oscar-transformers/{oscar_transformers/rotation.py, tests/test_rotation_smollm3.py}", "purpose": "SmolLM3 attention-class dispatch (_build_smollm3_patched_forward) + 3 new tests."},
+    {"path": "third_party/ml-epicache (submodule, b742661)", "purpose": "EpiCache pilot subject (Apple ml-epicache MIT)."}
   ],
   "data_artifacts_this_session_gitignored": [
-    "outputs/oscar_int2_gpqacal_v5_conv0_smoke.json — v5 anchor (17 k, ratio 1.33)",
-    "outputs/oscar_int4_identity_conv0_smoke.json — v4b (INT4 + identity, both arms 0.0)",
-    "outputs/oscar_int4_gpqacal_conv0_smoke.STALE.json — stale; do not trust",
-    "outputs/oscar_int2_v6_conv41_22k.* — v6 partial (crashed in delta arm rebuild)",
-    "outputs/oscar_int2_v6b_conv41_noshadow.* — v6b partial (4/10 delta scored)",
-    "outputs/oscar_int2_v6c_conv41_bs1_noshadow.json — v6c full 10+10 (25 k, ratio 0.60)"
+    "outputs/nf4_oscar_conv0_10q.json — NF4+OSCAR collapse (base 0, delta 0.145)",
+    "outputs/nf4_bf16kv_conv0_10q.json — NF4+bf16 KV win (base 0.379, delta 0.296)",
+    "outputs/nf4_bf16kv_conv41_25k.json — NF4+bf16 KV at 25k, IN PROGRESS at handoff time"
   ],
-  "next_planned_phase": {
-    "name": "Long-context delta-mem adapter training on Strix Halo",
-    "rationale": "Quality ceiling at ~17 k is set by the published adapter's training distribution. Memory tricks alone can't move it. Strix Halo's 96 GB unified VRAM is enough for 32-64 k fine-tuning of Qwen3-4B + delta-mem adapter with gradient checkpointing.",
-    "primary_doc": "STRIX_INSTRUCTIONS.md",
-    "first_milestone": "Software-stack sanity: ROCm-PyTorch loads Qwen3-4B-Instruct-2507 + published adapter on Strix Halo and matches CUDA outputs on a 1 k-token smoke prompt.",
-    "phase_1_target": "32 k context fine-tune from published adapter; success = ratio >= 1.20 at conv-41/10 q on this host.",
-    "phase_2_target": "64 k context further fine-tune; success = ratio >= 1.10 at synthetic conv-26_x2."
-  },
-  "open_followups_not_blocking_strix_pivot": [
-    {"item": "CPU RAM offload of dequant shadow", "value": "Push 12 GB VRAM ceiling from ~25 k to ~30 k. Useful only after longer-context adapter exists."},
-    {"item": "Default eval_batch_size to 1 for OSCAR backend", "value": "Prevents first-try OOMs at >22 k context. Minor ergonomics."},
-    {"item": "Add --adapter-override CLI flag to locomo_eval.py", "value": "Simplifies the round-trip from Strix Halo without editing EVAL_CONFIG. ~20 LOC."}
+  "currently_running": [
+    {
+      "task": "NF4+bf16 KV validation at conv-41 (25k context)",
+      "background_id": "bkj2wmh5d",
+      "started": "2026-06-09 ~21:00",
+      "eta_total": "~3h",
+      "output": "outputs/nf4_bf16kv_conv41_25k.json",
+      "hypothesis": "NF4+bf16 KV base will degrade gracefully past 17k since attention isn't pinched by OSCAR. v6c (delta-mem+OSCAR at 25k) was base 0.231 / delta 0.139; expect NF4+bf16 KV base similar or better."
+    }
+  ],
+  "next_action": "1. Read outputs/nf4_bf16kv_conv41_25k.json if eval has finished. 2. Spawn Strix coordinator 6th attempt (all 8 blockers now patched in 0b06276; should land training cleanly). 3. Decide EpiCache Day 2 timing — now sharpened to 64k+ use case after NF4+bf16 KV unlocked 17-32k base-only.",
+  "open_followups": [
+    {"item": "Strix coordinator 6th attempt", "value": "Should kick off phase-1 long-context training on Strix Halo with no further blockers expected.", "urgency": "high — Strix is set up and waiting"},
+    {"item": "NF4@32k synthetic eval", "value": "Validate NF4+bf16 KV base-only at synthetic conv-26-x2 (~32k) to confirm the budget extrapolation holds.", "urgency": "medium — quick (~3h) and informative"},
+    {"item": "EpiCache Day 2 (5-7 engineer-days)", "value": "Implement the parallel inference pipeline that replaces the NotImplementedError. Sharpens at 64k+ or as quality booster at 25-32k where delta-mem regresses.", "urgency": "low until Option 1 result is in"},
+    {"item": "SmolLM3 OSCAR calibration + adapter training", "value": "64k context fits on 12 GB with this backbone. Needs GPU rotation calibration + new adapter training run.", "urgency": "low — Option 1 with Qwen3-4B is the higher-leverage path"},
+    {"item": "Refresh .planning/.continue-here.md and HANDOFF.json", "value": "Done in this commit.", "urgency": "done"}
   ],
   "hard_earned_lessons_do_not_forget": [
-    "locomo_eval.py reuses existing output JSONs if present; always rename to *.STALE.json before relaunching.",
-    "Cross-arm cache invalidation is required between base and delta arms for non-bf16 KV backends (wired in commit 35612a4).",
-    "OSCAR_K_ROTATION_PATH and OSCAR_V_ROTATION_PATH env vars are mandatory whenever KV_CACHE_BACKEND=oscar.",
-    "Transient CUDA 'unknown error' crashes on this driver are nuisance noise after long runs; re-run usually fixes them. Not a code bug.",
-    "INT4 OSCAR is NOT a quality upgrade over INT2 in this stack. INT4 base improves but delta-mem corrections were calibrated against INT2's noise floor."
-  ],
-  "uncommitted_files": [],
-  "next_action": "Begin Strix Halo setup per STRIX_INSTRUCTIONS.md. First concrete step: verify ROCm 6.2+ install on the Strix Halo box and run the sanity-check script in section 'Software stack > Sanity check before training'."
+    "Worktree isolation does NOT always isolate file writes — agents' Edit/Write target absolute paths and can leak into main worktree.",
+    "Bash CWD drifts when you cd into worktrees during inspection; re-orient before each git commit/push.",
+    "PowerShell ExecutionPolicy blocks -File invocations on Strix; use -ExecutionPolicy Bypass.",
+    "Activate.ps1 also hits ExecutionPolicy; call .venv\\Scripts\\python.exe directly.",
+    "scp -r nests into existing remote dirs; use ./dir/. trailing-merge idiom OR install rsync (Scoop dropped rsync; Choco needs admin).",
+    "Triton-Windows AMD backend has bf16-affine-scan codegen bug on gfx1151; force DELTA_MEM_SCAN_IMPL=torch.",
+    "locomo_eval.py reuses existing output JSONs; rename to *.STALE.json before re-running.",
+    "ssh strix from msys2/Git-Bash fails with libcrypto error; tools/strix_ssh.py picks native Windows OpenSSH automatically.",
+    "rocm-smi is NOT bundled with ROCm-on-Windows 7.1; use python -c 'import torch; print(torch.cuda.is_available())' as the GPU-ready gate.",
+    "NF4 + OSCAR INT2 compound badly (base collapse). NF4 + bf16 KV is fine. Don't stack NF4 with OSCAR until rotations are re-calibrated against NF4 statistics.",
+    "delta-mem's adapter is 4.9 M trainable params (252 tensors), much smaller than my prior 50 M estimate.",
+    "gradient_checkpointing_kwargs={use_reentrant: True} is NON-NEGOTIABLE for delta-mem training (Triton scan saved_tensors).",
+    "EpiCache is a parallel inference pipeline NOT a Cache subclass — wiring needs 200-350 LOC of pipeline bridging."
+  ]
 }
