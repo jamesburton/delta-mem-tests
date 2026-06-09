@@ -361,6 +361,7 @@ work). ~5 h wall time on this card.
 | **3. Gemma 3n + new adapter** | 200-400 LOC + training | $200-600+ | requires Option 4 to fit weights | multimodal upside |
 | **4. NF4 weight quant** (inference only) | ~80 LOC | $0 | ✓✓✓ ~4.6 GB at 32 k | small unknown cost; orthogonal to 1-3 |
 | **Phase A (Option 1 + Option 4)** | ~80 LOC | $50-300 H100 | ~4.6 GB | best near-term |
+| **E. EpiCache pilot** (Apple ml-epicache) | ~350 LOC (Day-1 scaffold landed 2026-06-09: submodule + Qwen3 adapter + CLI + smoke); Day-2 GPU work to make it functional | 0 (training-free, ~1 GPU-hour BookSum calibration on this host) | ~9.3 GB at 100 k (paper, LLaMA-3.2-3B) — eviction caps KV growth, complements NF4 weights | up to 40 % accuracy lift vs SnapKV/H2O/KVzip on LoCoMo per paper; **stack with delta-mem at 25 k+ is the highest-upside untested combination** ([alternatives doc Section E](.planning/research/long-context-alternatives.md)) |
 
 **Bottom line**: the realistic path to 32 k useful context on this 12 GB
 box is **train a longer-context Qwen3-4B adapter** (already planned for
@@ -374,3 +375,115 @@ week project.
 Want me to land the NF4 inference patch (Option 4) and run the 32 k
 synthetic VRAM probe (the verification harness above) as the first
 moves? Both are doable on this box today.
+
+---
+
+## Update — EpiCache pilot Day-1 prep (2026-06-09)
+
+Following the NF4 + OSCAR INT2 compounding collapse above (delta-arm
+ratio 0.36 -> 0.14 at 17 k), and per the recommendation in
+[`.planning/research/long-context-alternatives.md`](.planning/research/long-context-alternatives.md)
+Section E, we are piloting **EpiCache** (Apple ml-epicache) as an
+orthogonal eviction-based mechanism that may stack with delta-mem at 25 k+
+where the published adapter regresses.
+
+### Day-1 deliverables landed (CPU-only, GPU was busy with NF4 eval)
+
+- **Submodule pinned**: `third_party/ml-epicache` at commit
+  `b742661a1b763d0a57f0a1c6b82acbdbe5ed578c` (Apple's 2025-10-02 public
+  release; same commit the alternatives doc identified).
+- **Install doc**: [`third_party/ml-epicache-install.md`](third_party/ml-epicache-install.md)
+  documents CPU-safe install steps and Day-2 GPU-only steps
+  (flash-attn 2.7.4.post1, `csrc/make` for tiny_api_cuda).
+- **Qwen3 adapter**: [`run/epicache_qwen3_adapter.py`](run/epicache_qwen3_adapter.py)
+  ports EpiCache's Qwen2.5 monkeypatch to Qwen3 — upstream's
+  `model/monkeypatch.py` lacks a Qwen3 branch even though
+  `model/wrapper.py` imports `Qwen3ForCausalLM`. Exposes
+  `install_epicache_on_qwen3(model, ...)` which the runner calls once
+  per attention-identity (mirrors the OSCAR `apply_rotations` pattern).
+  Three TODOs documented in the file's docstring: q_norm/k_norm handling
+  (Qwen3 has them, EpiCache's Llama forward does not apply them), the
+  CPU-deferred attention.attn import, and the missing
+  `LongConvQAModel`-style episode-cache pipeline.
+- **CLI wiring**: `--kv-cache-backend epicache` plus five EpiCache
+  knobs (`--epicache-budget` 4096, `--epicache-n-clusters` 4,
+  `--epicache-prefill-chunk-size` 2048, `--epicache-level pair`,
+  `--epicache-scoring-method clustering`, `--epicache-score-path`)
+  propagate via env vars to `run/_chunked_eval_runner.py` exactly like
+  the OSCAR / NF4 patterns.
+- **Runner branch**: `_chunked_eval_runner.py:_new_kv_cache` recognises
+  `KV_CACHE_BACKEND=epicache`, runs `install_epicache_on_qwen3`, then
+  **raises NotImplementedError** because the real eviction pipeline does
+  not slot into our `session._ingest_full_ids -> _decode_generate` flow.
+  This is the load-bearing finding: see "Integration-shape caveat" below.
+- **Smoke**: `run/epicache_smoke.py` runs 5 checks (submodule + commit
+  pin, adapter import, CLI choices, runner dispatch, Qwen3-stub wiring)
+  in <30 s on CPU with no GPU touch. **Result: ALL CHECKS PASSED**.
+  Confirms `num_attention_heads=32 num_key_value_heads=8 head_dim=128`
+  for Qwen3-4B (GQA grouping=4); EpiCache's `EvictCache` reads these
+  config fields directly so the GQA path is correct without changes.
+
+### Integration-shape caveat (correction to alternatives doc)
+
+After reading EpiCache's code in detail, the alternatives doc's
+description of EpiCache as "drop-in Cache subclass + monkeypatch" is
+oversimplified:
+
+- The `EvictCache` Cache subclass is real, but it does NOT drop into
+  `model.generate(past_key_values=...)` like `DynamicCache` does.
+- The actual flow (`third_party/ml-epicache/run_epicache.py:35-180`)
+  requires a custom `LongConvQAModel` wrapper that calls
+  `model.prefill_memory_constrained(ctx_ids, ...)` once per episode,
+  caches each episode's `EvictCache` to CPU, then on each query does
+  embed-question -> match-centroid -> restore-cache -> `model.generate`.
+- That pipeline must be reimplemented inside our chunked runner; it does
+  not co-exist trivially with `DeltaMemChatSession`. Estimated Day-2
+  work for that bridge alone: 200-350 LOC, plus the flash-attn install
+  / SDPA fallback (Phase 3 of the alternatives doc).
+
+The doc's "~150 LOC including a small layer-sensitivity calibration
+script" is therefore an underestimate by roughly 2-3x. Pilot is still
+worth running — the headline accuracy numbers and the
+delta-mem-+-EpiCache stack hypothesis are unchanged — but the engineering
+budget should be revised to **5-7 engineer-days for Qwen3-4B alone**
+rather than the doc's 3-4.
+
+### Day-2 readiness checklist (next agent picks up here)
+
+1. **Wait for the NF4 eval to free the GPU.**
+2. **Install flash-attn**: `.venv\Scripts\python.exe -m pip install
+   flash-attn==2.7.4.post1 --no-build-isolation`. On native Windows this
+   will likely fail; either (a) move to WSL2 + CUDA toolkit, or (b) patch
+   `third_party/ml-epicache/attention/attn.py` to fall back to SDPA
+   (replace `flash_attn_varlen_func` + `_flash_attention_forward` with
+   `torch.nn.functional.scaled_dot_product_attention`, ~50 LOC). The
+   alternatives doc recommends (b) for this 12 GB box.
+3. **Build tiny_api_cuda**: `cd third_party\ml-epicache\csrc && make`.
+   Requires `CUDA_HOME` set and `nvcc` on PATH. On native Windows, again
+   may need WSL2; if blocked, patch
+   `third_party/ml-epicache/attention/kvcache.py` to use the Python
+   for-loop fallback already present in `EvictCache.update`'s
+   `else: # use adapted kernel` branch (the kernel is for decode-time
+   single-token updates; prefill works without it).
+4. **BookSum layer-sensitivity calibration on Qwen3-4B**:
+   ```powershell
+   python third_party\ml-epicache\data\booksum\preproc_booksum.py `
+       --model_path Qwen/Qwen3-4B-Instruct-2507 --max_length 16384
+   python third_party\ml-epicache\data\layer_scores\layer_profile.py `
+       --model_path Qwen/Qwen3-4B-Instruct-2507 `
+       --input_file <booksum_pre_path>
+   ```
+   Output: `data/layer_scores/booksum_Qwen3-4B-Instruct_sample0_layer_scores.json`.
+   ~1 GPU-hour on the 12 GB box per alternatives doc.
+5. **Implement the episode-cache pipeline** in
+   `run/epicache_qwen3_adapter.py:build_episode_caches` and wire it into
+   `_chunked_eval_runner.py`'s `_chunked_official_full_history_answer`
+   path (replace the `NotImplementedError` raise in
+   `_new_kv_cache(model)` -> `KV_CACHE_BACKEND == "epicache"`).
+6. **Conv-41 baseline + EpiCache-only comparison** (alternatives doc
+   "Day 2"): three runs on conv-41 / 10 q:
+   - A. `--kv-cache-backend bf16` (control).
+   - B. `--kv-cache-backend epicache --epicache-budget 4096` (no OSCAR,
+     no delta-mem — pure EpiCache).
+   - C. (already have from v6c) delta-mem + OSCAR INT2 at 25 k.
+   Exit criterion: does B's delta score at 25 k beat C's 0.139?

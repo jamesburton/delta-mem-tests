@@ -4,3 +4,6 @@
 [submodule "third_party/oscar-transformers"]
 	path = third_party/oscar-transformers
 	url = https://github.com/jamesburton/oscar-transformers.git
+[submodule "third_party/ml-epicache"]
+	path = third_party/ml-epicache
+	url = https://github.com/apple/ml-epicache.git
