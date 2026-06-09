@@ -408,6 +408,17 @@ the PLE table too (untested by Google; not in any published recipe). The
 
 ## 7. Alternatives to building Gemma support ourselves
 
+> **Deep-dive companion doc:** EpiCache and LoCoCo are evaluated in detail
+> in [`long-context-alternatives.md`](./long-context-alternatives.md)
+> (side-by-side comparison, integration cost analysis, 3-day pilot
+> proposal). Summary: **EpiCache** is the strongest stacking candidate
+> against our existing OSCAR+delta-mem (training-free, MIT, fresh
+> Oct-2025 Apple release, evaluates natively on LoCoMo, Qwen2.5/Llama-3
+> already wired); the Qwen3 port is ~50 LOC. **LoCoCo** is not
+> competitive (dead repo since Sep-2024, Llama-2-7B-only intrusive
+> fork, no GQA support, training required, no published checkpoint,
+> no LoCoMo eval).
+
 1. **EpiCache (ArXiv 2509.17396, Sep 2025)** — episodic KV cache
    management for long-term conversation on resource-constrained
    environments. Works as a drop-in on any HF attention class via
