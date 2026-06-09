@@ -270,6 +270,59 @@ quality at 32 k.
 
 ---
 
+## Update — NF4 + OSCAR INT2 compounding result (measured)
+
+The Phase-A step-1 experiment ran on 2026-06-09 with the existing
+published adapter on conv-26 / 10 q (17.5 k context). Result was much
+worse than the "small unknown cost" the plan predicted:
+
+| Config | base | delta | ratio |
+|--------|------|-------|-------|
+| v5 (bf16 weights + OSCAR INT2 + GPQA-rot) | 0.2735 | **0.3642** | 1.332 |
+| **NF4 (NF4 weights + OSCAR INT2 + GPQA-rot)** | **0.0000** | **0.1455** | undefined |
+
+The **base arm collapses completely** — every prediction is gibberish
+token soup (`"stringcomparison-'7gli6dm[]( financed"`,
+`"a ast thanksbelakh"`). The compounding of NF4 weight perturbation
+on top of OSCAR's bf16-calibrated rotations breaks attention entirely
+on the un-corrected arm.
+
+The **delta arm rescues the model** to coherent (if degraded) text —
+real answers like `"melanie ran a charity race on 9 june, 2023"` and
+`"counseling, mental health, and self-care"`. delta-mem's learned
+corrections carry enough semantic information from prefill that real
+answers emerge even when the base attention is producing noise. **This
+is unexpected behaviour worth flagging as a research-interesting
+result**, separate from the production usability question.
+
+For production at this context length, the 60 % delta-arm drop
+(0.36 → 0.14) is too steep. NF4 + OSCAR INT2 is not a usable inference
+combination as currently configured.
+
+**Recovery paths**:
+
+1. **NF4 + bf16 KV + delta-mem** (untested). Skip the OSCAR layer
+   entirely under NF4. bf16 KV at 17 k costs ~2.4 GB vs OSCAR INT2's
+   ~0.33 GB — net VRAM saving from NF4 alone is ~5.2 GB - 2.1 GB =
+   ~3 GB after losing the OSCAR win. Still enough headroom for 32 k.
+   Avoids the rotation-vs-NF4 mismatch. **Cheap to test (no new code,
+   just `--quantize-backbone-int4` without setting `KV_CACHE_BACKEND=oscar`).**
+
+2. **Re-calibrate OSCAR rotations against NF4 attention statistics**.
+   Run the 3-phase calibration with the model loaded in NF4. Significant
+   GPU time but addresses the root cause. **Probably overkill unless
+   path 1 doesn't free enough VRAM for the target context.**
+
+3. **Drop NF4 entirely**; rely on adapter retrain (Option 1) for the
+   32 k push. Confirmed by this result: the 12 GB box's NF4 path is
+   not a shortcut around the long-context adapter training.
+
+**Updated Phase-A recommendation**: do path 1 (NF4 + bf16 KV) before
+committing to Option 1. Path 1 takes ~3 h on this host; if it works,
+we have a 32 k production config without any new training.
+
+---
+
 ## Quick verification harness (immediate-action)
 
 ```powershell
