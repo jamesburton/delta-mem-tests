@@ -63,7 +63,7 @@ KV_CACHE_BITS = int(os.environ.get("KV_CACHE_BITS", "0"))
 # Set OFF by default; existing eval runs stay bit-identical.
 QUANTIZE_BACKBONE_INT4 = os.environ.get("QUANTIZE_BACKBONE_INT4", "0") == "1"
 
-_VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq", "oscar"}
+_VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq", "oscar", "epicache"}
 if KV_CACHE_BACKEND not in _VALID_BACKENDS:
     raise ValueError(
         f"KV_CACHE_BACKEND={KV_CACHE_BACKEND!r} not in {sorted(_VALID_BACKENDS)}"
@@ -118,6 +118,35 @@ elif KV_CACHE_BACKEND == "oscar":
     _OSCAR_K_CLIP = float(os.environ.get("OSCAR_K_CLIP", "0.96"))
     _OSCAR_V_CLIP = float(os.environ.get("OSCAR_V_CLIP", "0.92"))
     _OSCAR_GROUP = int(os.environ.get("OSCAR_GROUP_SIZE", "128"))
+elif KV_CACHE_BACKEND == "epicache":
+    # Apple ml-epicache (Day-1 pilot scaffold). EpiCache is fundamentally an
+    # eviction policy + custom Cache subclass + monkeypatched attention
+    # forward; the full inference pipeline (clustering -> per-episode prefill
+    # -> query-episode matching -> dispatch) does NOT fit the
+    # `_new_kv_cache(model)` shape used by oscar/hqq/quanto. The Day-1 wiring
+    # only validates that the CLI choice + env-var plumbing reach the runner;
+    # actually constructing the episode caches and dispatching per query
+    # requires Day-2 GPU work (flash-attn install, tiny_api_cuda build,
+    # BookSum calibration). See third_party/ml-epicache-install.md
+    # "Integration-shape caveat" and run/epicache_qwen3_adapter.py for the
+    # adapter scaffold.
+    _EPICACHE_KV_BUDGET = int(os.environ.get("EPICACHE_KV_BUDGET", "4096"))
+    _EPICACHE_N_CLUSTERS = int(os.environ.get("EPICACHE_N_CLUSTERS", "4"))
+    _EPICACHE_PREFILL_CHUNK_SIZE = int(os.environ.get("EPICACHE_PREFILL_CHUNK_SIZE", "2048"))
+    _EPICACHE_LEVEL = os.environ.get("EPICACHE_LEVEL", "pair")
+    _EPICACHE_SCORING_METHOD = os.environ.get("EPICACHE_SCORING_METHOD", "clustering")
+    _EPICACHE_SCORE_PATH = os.environ.get("EPICACHE_SCORE_PATH")
+    # Add EpiCache submodule to sys.path so the adapter can later import
+    # `attention.*` / `model.*` from there. The adapter does this defensively
+    # too, but doing it here also exposes a clear failure mode if the
+    # submodule is missing.
+    from run.epicache_qwen3_adapter import _ensure_epicache_on_path
+    _ensure_epicache_on_path()
+    # Track which attention identity has been EpiCache-patched, so we can
+    # re-apply when attach_delta_adapter_in_place swaps attention modules
+    # between base/delta arms (same pattern as OSCAR's
+    # `_OSCAR_ROTATED_ATTN_ID` guard below).
+    _EPICACHE_PATCHED_ATTN_ID: int = 0
 
 
 # Track which attention identity (by id of the first self_attn module) we
@@ -148,6 +177,39 @@ def _new_kv_cache(model):
             backend=KV_CACHE_BACKEND,
             config=model.config,
             nbits=bits,
+        )
+    if KV_CACHE_BACKEND == "epicache":
+        # Day-1 wiring placeholder — see the EpiCache integration-shape note
+        # in third_party/ml-epicache-install.md. The real Day-2 pipeline:
+        #   1) Build E=4 episode clusters from the conversation history
+        #      using utils.cluster.ClusterManager (CPU, ~seconds).
+        #   2) For each episode, call EpiCache's
+        #      `model.prefill_memory_constrained(ctx_ids, ...)` to fill
+        #      an EvictCache, evict to budget M, move to CPU.
+        #   3) Per question: embed -> match episode -> restore that cache
+        #      -> generate via EpiCache's `model.generate(qids, kv=cache)`.
+        # That flow does NOT slot into the current
+        # `session._ingest_full_ids` -> `session._decode_generate` chain; it
+        # needs a parallel dispatch in the official_full_history path. Raise
+        # here so it's obvious if someone selects the backend before Day-2
+        # lands.
+        global _EPICACHE_PATCHED_ATTN_ID
+        current_attn = model.model.layers[0].self_attn
+        if id(current_attn) != _EPICACHE_PATCHED_ATTN_ID:
+            from run.epicache_qwen3_adapter import install_epicache_on_qwen3
+            diag = install_epicache_on_qwen3(
+                model,
+                require_flash_attn=True,
+                require_tiny_api_cuda=True,
+            )
+            print(f"[epicache] patched attention: {diag}", flush=True)
+            _EPICACHE_PATCHED_ATTN_ID = id(current_attn)
+        raise NotImplementedError(
+            "KV_CACHE_BACKEND=epicache is a Day-1 wiring scaffold only. "
+            "Episode-cache construction + per-query dispatch are Day-2 work. "
+            "See run/epicache_qwen3_adapter.py:build_episode_caches, "
+            "third_party/ml-epicache-install.md, and "
+            ".planning/research/long-context-alternatives.md Section E."
         )
     if KV_CACHE_BACKEND == "oscar":
         current_attn = model.model.layers[0].self_attn

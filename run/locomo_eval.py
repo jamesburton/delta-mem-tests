@@ -148,6 +148,12 @@ def _invoke_vendored_eval(
     kv_cache_backend: str = "bf16",
     kv_cache_bits: int = 0,
     quantize_backbone_int4: bool = False,
+    epicache_budget: int = 4096,
+    epicache_n_clusters: int = 4,
+    epicache_prefill_chunk_size: int = 2048,
+    epicache_level: str = "pair",
+    epicache_scoring_method: str = "clustering",
+    epicache_score_path: str | None = None,
 ) -> Path:
     """Invoke the vendored LoCoMo eval. Returns the path to the scores JSON.
 
@@ -202,6 +208,25 @@ def _invoke_vendored_eval(
         print(
             "  QUANTIZE_BACKBONE_INT4=1 "
             "(NF4 bnb weights + bf16 compute; KV-backend independent)"
+        )
+    if kv_cache_backend == "epicache":
+        # Propagate EpiCache CLI knobs to the chunked runner via env vars,
+        # mirroring the OSCAR pattern. The runner reads these inside the
+        # `elif KV_CACHE_BACKEND == "epicache"` branch of `_new_kv_cache`.
+        subprocess_env["EPICACHE_KV_BUDGET"] = str(epicache_budget)
+        subprocess_env["EPICACHE_N_CLUSTERS"] = str(epicache_n_clusters)
+        subprocess_env["EPICACHE_PREFILL_CHUNK_SIZE"] = str(epicache_prefill_chunk_size)
+        subprocess_env["EPICACHE_LEVEL"] = epicache_level
+        subprocess_env["EPICACHE_SCORING_METHOD"] = epicache_scoring_method
+        if epicache_score_path:
+            subprocess_env["EPICACHE_SCORE_PATH"] = epicache_score_path
+        print(
+            f"  EPICACHE_KV_BUDGET={epicache_budget} "
+            f"EPICACHE_N_CLUSTERS={epicache_n_clusters} "
+            f"EPICACHE_LEVEL={epicache_level} "
+            f"EPICACHE_SCORING_METHOD={epicache_scoring_method} "
+            f"EPICACHE_SCORE_PATH={epicache_score_path or '(none)'} "
+            "(EpiCache pilot scaffold; Day-2 work required to make this functional)"
         )
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(
@@ -298,7 +323,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--kv-cache-backend",
-        choices=["bf16", "turboquant", "quanto", "hqq", "oscar"],
+        choices=["bf16", "turboquant", "quanto", "hqq", "oscar", "epicache"],
         default="bf16",
         help="KV-cache quantisation backend. `bf16` (default) keeps the bf16 "
              "DynamicCache plus our per-conversation crop+reuse trick. "
@@ -309,6 +334,11 @@ def main() -> int:
              "`oscar` uses the vendored oscar-transformers port: per-layer "
              "orthogonal Q/K/V rotation + sink/recent/INT2-middle cache; "
              "requires OSCAR_K_ROTATION_PATH and OSCAR_V_ROTATION_PATH env vars. "
+             "`epicache` (Day-1 pilot scaffold) uses Apple ml-epicache "
+             "(third_party/ml-epicache) episodic KV eviction; requires "
+             "flash-attn + tiny_api_cuda built (Day-2). See "
+             "third_party/ml-epicache-install.md and "
+             ".planning/research/long-context-alternatives.md for pilot status. "
              "Any non-bf16 backend disables cross-question KV-cache reuse.",
     )
     parser.add_argument(
@@ -317,6 +347,55 @@ def main() -> int:
         default=0,
         help="Bit-width for the quantisation backend (0 = backend default: "
              "turboquant->4, quanto/hqq->2).",
+    )
+    parser.add_argument(
+        "--epicache-budget",
+        type=int,
+        default=4096,
+        help="EpiCache per-episode KV budget M (tokens retained per episode "
+             "after eviction). Paper recommends ~4 K for LoCoMo; the "
+             "pilot defaults to 4096. Only used when --kv-cache-backend "
+             "epicache. Propagated to the runner via EPICACHE_KV_BUDGET env var.",
+    )
+    parser.add_argument(
+        "--epicache-n-clusters",
+        type=int,
+        default=4,
+        help="Number of conversation episodes E for EpiCache clustering "
+             "(default 4 per upstream scripts/run_epicache_qwen.sh). "
+             "Propagated as EPICACHE_N_CLUSTERS.",
+    )
+    parser.add_argument(
+        "--epicache-prefill-chunk-size",
+        type=int,
+        default=2048,
+        help="EpiCache block-prefill eviction chunk size M_block (default "
+             "2048; upstream args.py default). Propagated as "
+             "EPICACHE_PREFILL_CHUNK_SIZE.",
+    )
+    parser.add_argument(
+        "--epicache-level",
+        choices=["pair", "head", "pair-uniform"],
+        default="pair",
+        help="EpiCache eviction granularity: `pair` head-wise (paper's "
+             "best), `pair-uniform` uniform per head, `head` "
+             "context-independent. Propagated as EPICACHE_LEVEL.",
+    )
+    parser.add_argument(
+        "--epicache-scoring-method",
+        choices=["clustering", "snapkv", "kvzip", "infinipot", "keydiff"],
+        default="clustering",
+        help="EpiCache importance-scoring method. Default `clustering` is "
+             "EpiCache's own; the others are the baselines its paper compares "
+             "against. Propagated as EPICACHE_SCORING_METHOD.",
+    )
+    parser.add_argument(
+        "--epicache-score-path",
+        default=None,
+        help="Path to a BookSum layer-sensitivity JSON (generated via "
+             "third_party/ml-epicache/data/layer_scores/layer_profile.py, "
+             "GPU-only). When set, enables sensitivity-aware per-layer "
+             "budget allocation. Propagated as EPICACHE_SCORE_PATH.",
     )
     parser.add_argument(
         "--turboquant-bits",
@@ -416,6 +495,12 @@ def main() -> int:
         kv_cache_backend=args.kv_cache_backend,
         kv_cache_bits=args.kv_cache_bits,
         quantize_backbone_int4=args.quantize_backbone_int4,
+        epicache_budget=args.epicache_budget,
+        epicache_n_clusters=args.epicache_n_clusters,
+        epicache_prefill_chunk_size=args.epicache_prefill_chunk_size,
+        epicache_level=args.epicache_level,
+        epicache_scoring_method=args.epicache_scoring_method,
+        epicache_score_path=args.epicache_score_path,
     )
 
     if args.kv_cache_backend != "bf16":
@@ -428,6 +513,13 @@ def main() -> int:
             "(residual-window kept in original precision; "
             "cross-question reuse disabled)"
         )
+    if args.kv_cache_backend == "epicache":
+        EVAL_CONFIG["epicache_budget"] = args.epicache_budget
+        EVAL_CONFIG["epicache_n_clusters"] = args.epicache_n_clusters
+        EVAL_CONFIG["epicache_prefill_chunk_size"] = args.epicache_prefill_chunk_size
+        EVAL_CONFIG["epicache_level"] = args.epicache_level
+        EVAL_CONFIG["epicache_scoring_method"] = args.epicache_scoring_method
+        EVAL_CONFIG["epicache_score_path"] = args.epicache_score_path or "(none)"
     if args.quantize_backbone_int4:
         EVAL_CONFIG["backbone_quantization"] = (
             "nf4 (bnb 4-bit weights, bf16 compute, double-quant)"
