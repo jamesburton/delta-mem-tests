@@ -441,6 +441,152 @@ before promotion.
 
 ---
 
+## Windows-on-Strix variant (current production target)
+
+The recipe above assumes Ubuntu 24.04 with ROCm on Linux. The **current
+production target is Windows 11 with ROCm-on-Windows installed natively**
+-- no WSL, no Linux dual-boot. This section documents the deltas; the
+data, hyperparameter, and adapter sections above are unchanged.
+
+### Topology
+
+- OS: Windows 11 Pro on the Strix Halo box.
+- GPU stack: AMD ROCm-on-Windows (see AMD's "Install ROCm on Windows":
+  https://rocm.docs.amd.com/projects/install-on-windows/en/latest/).
+- SSH: OpenSSH server on Windows. `ssh strix` lands on `cmd.exe`.
+- Python: native Windows Python 3.11 in a per-repo venv at
+  `.venv\Scripts\` (vs `.venv/bin/` on POSIX).
+- Repo: `C:\Users\james\delta-mem-tests` (default; adjust to taste).
+- Driver script: `strix\run_phase1.ps1` (PowerShell), not the bash variant.
+- Long-running launcher: `Start-Process -WindowStyle Hidden
+  -RedirectStandardOutput` (the tmux equivalent on Windows).
+
+### Prerequisites (one-time, on the Strix box)
+
+1. **ROCm on Windows** -- install per AMD's docs (link above). After
+   install, confirm `rocm-smi` runs from PowerShell and reports the
+   Radeon 8060S iGPU.
+2. **Python 3.11** -- install from python.org (NOT the Microsoft Store
+   variant; the Store variant has restricted filesystem semantics that
+   break HuggingFace caching).
+3. **Git for Windows** -- provides `git` and a bash shell if you want
+   one. (We use Windows-native OpenSSH instead of Git's bundled ssh; see
+   `tools/STRIX_SSH_USAGE.md`.)
+4. **(Optional) rsync** -- via MSYS2 or Git for Windows; without it the
+   `tools/strix_ssh.py copy-up` / `copy-down` commands fall back to
+   slower `scp -r`.
+
+### Software stack (PowerShell)
+
+```powershell
+# 1. ROCm -- already installed via the AMD installer above. Verify:
+rocm-smi --showuse
+
+# 2. Clone and venv
+cd C:\Users\james
+git clone --recursive https://github.com/jamesburton/delta-mem-tests
+cd delta-mem-tests
+git submodule update --init --recursive
+
+py -3.11 -m venv .venv
+. .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+
+# 3. PyTorch (ROCm-on-Windows wheels). Pick the version matching your
+#    installed ROCm. Example for ROCm 6.2:
+pip install --index-url https://download.pytorch.org/whl/rocm6.2 `
+    "torch==2.5.1" "torchvision==0.20.1"
+
+# 4. Transformers + accelerate (framework-agnostic)
+pip install "transformers==5.9.0" "accelerate>=0.34" "peft>=0.14" `
+    "safetensors" "huggingface_hub" "datasets" "trl"
+
+# 5. Triton -- PyTorch's ROCm-on-Windows wheel ships HIP-Triton. Verify:
+python -c "import triton; print(triton.__version__)"
+# If this fails, set $env:DELTA_MEM_DISABLE_TRITON='1' before training
+# (1.5x slower, correctness-equivalent).
+
+# 6. OSCAR loader (required for adapter inference / verify)
+pip install -e third_party\oscar-transformers
+
+# 7. Smoke
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+powershell.exe -NoProfile -File strix\test_runner_paths.ps1  # no-GPU wiring smoke
+python -m run.training_smoke --probe                          # GPU smoke
+```
+
+The `HSA_OVERRIDE_GFX_VERSION=11.5.1` and
+`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` env vars from the
+Linux recipe are **not currently needed on ROCm-Windows** -- the
+Windows driver advertises the RDNA 3.5 capabilities directly. Keep
+them in mind as a fallback if a future ROCm-Windows release misbehaves
+(set with `$env:HSA_OVERRIDE_GFX_VERSION='11.5.1'`).
+
+### Running training
+
+```powershell
+# Driver (on Strix, in cmd.exe after ssh):
+powershell.exe -NoProfile -File strix\run_phase1.ps1
+
+# Or from the local box (drops into cmd.exe on Strix):
+.\.venv\Scripts\python.exe -m tools.strix_ssh run `
+    "powershell.exe -NoProfile -File strix\run_phase1.ps1"
+```
+
+The PowerShell driver mirrors `run_phase1.sh` exactly: smoke -> data
+prep -> train. It uses `Start-Transcript` to capture all output to
+`logs\train_<timestamp>.log` automatically.
+
+### Long-running jobs (tmux replacement on Windows)
+
+Windows has no tmux. Use `Start-Process` with output redirection from
+the local box -- fire-and-forget, survives the SSH session closing:
+
+```powershell
+$env:STRIX_SHELL = "powershell"
+.venv\Scripts\python.exe -m tools.strix_ssh run @'
+$stamp = Get-Date -Format yyyyMMdd_HHmmss;
+Start-Process -FilePath powershell.exe `
+  -ArgumentList "-NoProfile","-File","strix\run_phase1.ps1" `
+  -WindowStyle Hidden `
+  -RedirectStandardOutput "logs\train_$stamp.log" `
+  -RedirectStandardError  "logs\train_$stamp.err"
+Write-Host "started; log: logs\train_$stamp.log"
+'@
+```
+
+Tail-follow from the local box:
+
+```powershell
+.venv\Scripts\python.exe -m tools.strix_ssh tail-log
+```
+
+### Cross-deploy back to this CUDA host
+
+Unchanged from the Linux section -- adapter safetensors are
+framework-agnostic. Pull with:
+
+```powershell
+# from this Windows/CUDA dev box
+.venv\Scripts\python.exe -m tools.strix_ssh copy-down checkpoints\longctx-v1-32k
+.venv\Scripts\python.exe -m strix.verify_checkpoint --ckpt checkpoints\longctx-v1-32k\final
+```
+
+### Why we kept the Linux/bash variant around
+
+`strix\run_phase1.sh` and the `STRIX_SHELL=bash` mode of
+`tools/strix_ssh.py` are retained for:
+
+- Future Ubuntu dual-boot on Strix (if ROCm-on-Windows regresses).
+- Containerised training (Docker on Linux is much smoother than on
+  Windows for ROCm).
+- Anyone reusing this repo on a rented Linux GPU host.
+
+The Windows variant supersedes Linux for the active production target
+but the bash recipe still works end-to-end.
+
+---
+
 ## Continuation pointer
 
 When Strix Halo training is set up and a checkpoint is ready, drop a note

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Strix Halo phase-1 training driver — single entry point.
+# Strix Halo phase-1 training driver -- single entry point.
+#
+# NOTE: this is the Linux/WSL variant. The current production target is
+# Windows-on-Strix with ROCm-on-Windows; use strix/run_phase1.ps1 there.
+# This bash script is preserved for the Linux-on-Strix case (Ubuntu
+# dual-boot or a future containerised setup). See STRIX_INSTRUCTIONS.md
+# "Windows-on-Strix variant" for the current default.
 #
 # Gates training behind training_smoke (required) and the idempotent
 # data prep, then kicks off the 32 k-context fine-tune with sensible
