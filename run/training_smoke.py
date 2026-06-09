@@ -26,6 +26,13 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+# Path-lock the deltamem scan kernel BEFORE the first deltamem import.
+# Mirrors run/_chunked_eval_runner.py:40. Critical on Strix Halo (gfx1151)
+# where the Triton-Windows AMD backend has an isUIntN assertion bug in the
+# bf16 affine-scan codegen — the torch fallback path avoids the kernel.
+os.environ.setdefault("DELTA_MEM_SCAN_IMPL", "torch")
+
 import sys
 import tempfile
 from pathlib import Path

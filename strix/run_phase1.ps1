@@ -10,6 +10,12 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Force the torch fallback for the delta-mem scan kernel BEFORE any python
+# invocation. Strix Halo (gfx1151) hits a Triton-Windows AMD-backend
+# isUIntN assertion in the bf16 affine_scan codegen; the torch path is
+# bit-equivalent and avoids the kernel entirely.
+$env:DELTA_MEM_SCAN_IMPL = 'torch'
+
 # Defaults (override via env or by editing this file before kickoff).
 $CkptDir  = if ($env:CKPT_DIR)  { $env:CKPT_DIR }  else { 'checkpoints\longctx-v1-32k' }
 $DataFile = if ($env:DATA_FILE) { $env:DATA_FILE } else { 'data\longctx_mix_v1.jsonl' }
@@ -21,13 +27,15 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot  = Resolve-Path (Join-Path $ScriptDir '..')
 Set-Location $RepoRoot
 
-# Activate the Windows venv. Activate.ps1 lives under .venv\Scripts\.
-$VenvActivate = Join-Path $RepoRoot '.venv\Scripts\Activate.ps1'
-if (-not (Test-Path $VenvActivate)) {
-    Write-Error "venv not found at $VenvActivate -- create one first: py -3.11 -m venv .venv"
+# Use the venv's python.exe directly. Dot-sourcing Activate.ps1 trips
+# Windows ExecutionPolicy on Strix; calling python.exe straight avoids
+# that entirely (and keeps PATH clean — Start-Transcript later in this
+# script doesn't care).
+$VenvPython = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path $VenvPython)) {
+    Write-Error "venv python not found at $VenvPython -- create one first: py -3.11 -m venv .venv"
     exit 1
 }
-. $VenvActivate
 
 # Tee everything to a timestamped transcript so a dropped SSH session
 # doesn't lose progress.
@@ -42,7 +50,7 @@ try {
     #    256 tokens before we burn 32 k-context hours. The --probe sweep
     #    confirms the largest fitting context too.
     Write-Host "[run_phase1] gate 1/3: training smoke + probe"
-    & python -m run.training_smoke --probe
+    & $VenvPython -m run.training_smoke --probe
     if ($LASTEXITCODE -ne 0) { throw "training_smoke failed (exit $LASTEXITCODE)" }
 
     # 2. Idempotent data prep -- exits fast if data\longctx_mix_v1.jsonl
@@ -50,13 +58,13 @@ try {
     #    and tokenises (a few GB of pull + an hour of CPU tokenisation).
     Write-Host ""
     Write-Host "[run_phase1] gate 2/3: prepare training mix"
-    & python -m strix.prepare_data --out $DataFile
+    & $VenvPython -m strix.prepare_data --out $DataFile
     if ($LASTEXITCODE -ne 0) { throw "prepare_data failed (exit $LASTEXITCODE)" }
 
     # 3. Main training. Saves every 200 steps + final checkpoint.
     Write-Host ""
     Write-Host "[run_phase1] gate 3/3: training ($Steps steps @ $Context ctx)"
-    & python -m strix.train_phase1 `
+    & $VenvPython -m strix.train_phase1 `
         --steps $Steps `
         --context $Context `
         --data $DataFile `
