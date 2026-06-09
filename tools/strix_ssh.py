@@ -61,7 +61,9 @@ def _strix_shell() -> str:
 
 
 def _strix_workdir() -> str:
-    default_windows = r"C:\Users\james\delta-mem-tests"
+    # User chose C:\Development\delta-mem-tests as the canonical Strix
+    # location (mirrors the dev host layout). Override with STRIX_REPO_DIR.
+    default_windows = r"C:\Development\delta-mem-tests"
     default_linux = "/home/james/delta-mem-tests"
     fallback = default_linux if _strix_shell() == "bash" else default_windows
     return os.environ.get("STRIX_REPO_DIR", fallback)
