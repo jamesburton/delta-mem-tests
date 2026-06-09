@@ -353,9 +353,30 @@ def main() -> int:
              "calibrated against bf16 weights, so a small quality cost is "
              "possible. See LONG_CONTEXT_PLAN.md Option 4 for details.",
     )
+    parser.add_argument(
+        "--model-override",
+        default=None,
+        help="HF model ID (e.g. 'HuggingFaceTB/SmolLM3-3B') OR an absolute "
+             "path to a local model snapshot. Overrides EVAL_CONFIG['model'] "
+             "before snapshot_download runs, so you can evaluate a different "
+             "backbone (SmolLM3-3B, etc.) without editing this file. Pair "
+             "with --adapter-override pointing at an adapter trained for "
+             "that backbone.",
+    )
     args = parser.parse_args()
     if args.eval_batch_size > 0:
         EVAL_CONFIG["eval_batch_size"] = args.eval_batch_size
+    if args.model_override:
+        # If it looks like an existing local directory, treat as an absolute
+        # local path; otherwise pass through as an HF repo ID for
+        # snapshot_download to resolve. Mirrors the adapter-override behaviour
+        # but does not require the override to be a directory (HF IDs aren't).
+        maybe_local = Path(args.model_override)
+        if maybe_local.exists() and maybe_local.is_dir():
+            EVAL_CONFIG["model"] = str(maybe_local.resolve())
+        else:
+            EVAL_CONFIG["model"] = args.model_override
+        EVAL_CONFIG["model_override"] = True
     if args.adapter_override:
         override_path = Path(args.adapter_override).resolve()
         if not override_path.is_dir():
