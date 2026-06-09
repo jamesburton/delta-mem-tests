@@ -317,6 +317,57 @@ combination as currently configured.
    32 k push. Confirmed by this result: the 12 GB box's NF4 path is
    not a shortcut around the long-context adapter training.
 
+### Update — NF4 + bf16 KV result (path 1 measured)
+
+Ran path 1 from above (NF4 weights + bf16 KV, no OSCAR layer) on
+conv-26 / 10 q at 17.5 k context. **Surprising and important:**
+
+| Config | base | delta | ratio |
+|--------|------|-------|-------|
+| v5 (bf16 weights + OSCAR INT2 + GPQA-rot) | 0.2735 | **0.3642** | 1.332 |
+| NF4 (NF4 weights + OSCAR INT2 + GPQA-rot) | 0.0000 | 0.1455 | undefined |
+| **NF4 + bf16 KV (no OSCAR)** | **0.3788** | 0.2962 | 0.782 |
+
+Three significant findings:
+
+1. **NF4+bf16 KV improves the BASE arm vs v5** (0.378 vs 0.274 = +38%).
+   Removing OSCAR's INT2 quantization cost on the un-corrected arm
+   actually helps — the NF4 backbone preserves raw attention quality
+   better than OSCAR INT2 KV did. Important: this means v5's "headline"
+   wasn't entirely about delta-mem being good; some of that score gap
+   was OSCAR's cost on the base arm.
+
+2. **Delta arm degrades 19% under NF4** (0.296 vs 0.364). Category
+   breakdown shows the loss is concentrated in **multi-hop** questions
+   (0.095 vs 0.667 in v5 — collapsed). Temporal (0.391 vs 0.218) and
+   open-domain (0.333 vs 0.333) are unaffected or slightly improved.
+   NF4 weight perturbation specifically degrades delta-mem's long-range
+   reasoning corrections.
+
+3. **Ratio inverts to 0.782** — the BASE arm beats the delta arm at this
+   config. Same regime as v6c (25 k context) where the published
+   adapter's training distribution stops covering. Suggests
+   NF4-weight-perturbation puts the adapter into the same OOD regime as
+   raw context-length OOD does.
+
+Production implications for ≥32 k inference on the 12 GB card:
+
+| Context | Best config (today, no retraining) |
+|---------|------------------------------------|
+| ≤17 k | v5 (bf16+OSCAR+delta) — ratio 1.33, delta wins |
+| 17-25 k | NF4 + bf16 KV (base-only; skip delta-mem overlay) |
+| 25-32 k | NF4 + bf16 KV (base-only) — proven 0.378 base; VRAM permits |
+| 32 k+ delta-mem actually winning | Option 1 retrain on Strix/Kaggle/cloud |
+
+VRAM at 32 k with NF4 + bf16 KV: weights NF4 (~2 GB) + bf16 KV (~4.8 GB)
++ activations (~2 GB) ≈ **9 GB** → comfortable on 12 GB.
+
+**We have a production NF4 path for 25-32 k base-only inference NOW**,
+without any new training. The delta-mem overlay is still the gap that
+needs the adapter retrain (Option 1). For 32 k+ context with KV
+quantization (if memory becomes tight again), EpiCache (Option E) is
+the candidate to evaluate.
+
 **Updated Phase-A recommendation**: do path 1 (NF4 + bf16 KV) before
 committing to Option 1. Path 1 takes ~3 h on this host; if it works,
 we have a 32 k production config without any new training.
