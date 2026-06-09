@@ -56,6 +56,13 @@ if _legacy_tq_bits > 0 and "KV_CACHE_BACKEND" not in os.environ:
 KV_CACHE_BACKEND = os.environ.get("KV_CACHE_BACKEND", "bf16").lower()
 KV_CACHE_BITS = int(os.environ.get("KV_CACHE_BITS", "0"))
 
+# NF4 backbone weight quantization (Option 4 of LONG_CONTEXT_PLAN.md).
+# When QUANTIZE_BACKBONE_INT4=1 we wrap the vendored load_base_model so that
+# AutoModelForCausalLM.from_pretrained receives a BitsAndBytesConfig instead
+# of a raw dtype. The adapter still loads in bf16 on top (QLoRA pattern).
+# Set OFF by default; existing eval runs stay bit-identical.
+QUANTIZE_BACKBONE_INT4 = os.environ.get("QUANTIZE_BACKBONE_INT4", "0") == "1"
+
 _VALID_BACKENDS = {"bf16", "turboquant", "quanto", "hqq", "oscar"}
 if KV_CACHE_BACKEND not in _VALID_BACKENDS:
     raise ValueError(
@@ -174,6 +181,116 @@ def _new_kv_cache(model):
             v_clip=_OSCAR_V_CLIP,
         )
     raise AssertionError("unreachable")
+
+
+# --- NF4 backbone monkeypatch (Option 4 of LONG_CONTEXT_PLAN.md) ---
+# When QUANTIZE_BACKBONE_INT4=1, wrap load_base_model so the backbone is
+# loaded with bitsandbytes NF4 4-bit weights + bf16 compute + double-quant.
+# Frees ~5-6 GB of weight VRAM on Qwen3-4B; adapter still loads in bf16
+# (QLoRA-style overlay). Untested in combination with OSCAR INT2 KV — the
+# rotations were calibrated against bf16 weights, so a small quality cost is
+# possible. Smoke validation is in run/nf4_smoke.py; full quality eval is a
+# follow-up.
+if QUANTIZE_BACKBONE_INT4:
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from deltamem.eval.locomo_delta import resolve_attn_implementation
+
+    # Caveat #1: DeltaMemAttention._init_delta_head reads `base.q_proj.weight`
+    # via 2D slice indexing (`base_weight[:, :slice_width]`). Under bnb NF4
+    # the base weight is a packed `Params4bit` (flat 1D shape), which crashes
+    # with a shape-mismatch on attach. We dequantize bnb 4-bit weights on
+    # read; the seeded slice is overwritten by the loaded adapter state
+    # anyway, so the dequant cost is paid once at attach time.
+    from bitsandbytes.nn import Params4bit
+    from bitsandbytes.functional import dequantize_4bit
+    from deltamem.core.delta_impl import DeltaMemAttention as _DMA
+
+    _orig_init_delta_head = _DMA._init_delta_head
+
+    def _nf4_init_delta_head(self, head, base_weight):
+        if isinstance(base_weight, Params4bit):
+            base_weight = dequantize_4bit(
+                base_weight.data, quant_state=base_weight.quant_state,
+            ).to(torch.bfloat16)
+        return _orig_init_delta_head(self, head, base_weight)
+
+    _DMA._init_delta_head = _nf4_init_delta_head
+
+    # Caveat #2: `attach_delta_mem` calls `.to(dtype=base.q_proj.weight.dtype)`
+    # on the wrapped attention module. Under bnb NF4 the base weight dtype is
+    # `torch.uint8` (packed 4-bit), which `nn.Module.to` rejects. We patch the
+    # call site to fall back to bf16 when the base weight is integer-typed.
+    import deltamem.core.delta as _delta_mod
+
+    def _nf4_attach_delta_mem(model, config):
+        from deltamem.core.delta import (
+            DeltaMemAttention, _get_parent_module, ensure_attention_compat_views,
+            Qwen3Attention, SmolLM3Attention,
+        )
+        if config.memory_readout_mode != "delta":
+            raise ValueError("only delta readout supported")
+        replaced = []
+        for name, module in list(model.named_modules()):
+            if not isinstance(module, (Qwen3Attention, SmolLM3Attention)):
+                continue
+            if name.split(".")[-1] not in config.target_modules:
+                continue
+            if config.target_layers and module.layer_idx not in config.target_layers:
+                continue
+            module = ensure_attention_compat_views(module)
+            parent, attr = _get_parent_module(model, name)
+            base_dtype = module.q_proj.weight.dtype
+            if not base_dtype.is_floating_point:
+                base_dtype = torch.bfloat16
+            wrapped = DeltaMemAttention(module, config).to(
+                device=module.q_proj.weight.device, dtype=base_dtype,
+            )
+            setattr(parent, attr, wrapped)
+            replaced.append(name)
+        if not replaced:
+            raise RuntimeError("No target modules were replaced")
+        return replaced
+
+    _delta_mod.attach_delta_mem = _nf4_attach_delta_mem
+    # The vendored eval also imports attach_delta_mem by name into
+    # deltamem.eval.locomo_delta; patch that reference too so attach_delta_adapter_in_place sees the wrapped version.
+    try:
+        from deltamem.eval import locomo_delta as _ld
+        _ld.attach_delta_mem = _nf4_attach_delta_mem
+    except Exception:
+        pass
+
+    _orig_load_base_model = eval_mod.load_base_model
+
+    def _nf4_load_base_model(*, model_path, device, dtype, attn_implementation):
+        resolved_attn_implementation = resolve_attn_implementation(
+            model_path, attn_implementation,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        # NF4 with bf16 compute (matches the LONG_CONTEXT_PLAN.md spec).
+        # device_map={"": device} on a quantized model puts everything on the
+        # chosen GPU; bnb's quantization happens at load time on that device.
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        print(
+            f"[nf4-backbone] loading {model_path} with bnb NF4 4-bit weights "
+            "+ bf16 compute + double-quant",
+            flush=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bnb_cfg,
+            device_map={"": device},
+            attn_implementation=resolved_attn_implementation,
+            local_files_only=True,
+        ).eval()
+        return model, tokenizer
+
+    eval_mod.load_base_model = _nf4_load_base_model
 
 
 def _chunked_build_teacher_forced_snapshot(model, tokenizer, device, history):
