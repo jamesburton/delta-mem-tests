@@ -114,7 +114,7 @@ PowerShell-only syntax.
 .venv\Scripts\python.exe -m tools.strix_ssh run "python -m run.training_smoke"
 
 # Kick off phase-1 training (PowerShell driver)
-.venv\Scripts\python.exe -m tools.strix_ssh run "powershell.exe -NoProfile -File strix\run_phase1.ps1"
+.venv\Scripts\python.exe -m tools.strix_ssh run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File strix\run_phase1.ps1"
 
 # Or, if STRIX_SHELL=powershell, just:
 $env:STRIX_SHELL = "powershell"

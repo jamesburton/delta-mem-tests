@@ -254,8 +254,24 @@ def cmd_copy_up(args: argparse.Namespace) -> int:
             continue
         if entry.name.startswith(".") and entry.name not in (".planning",):
             continue
-        target_path = f"{dst}{entry.name}"
-        cmd = [_scp_exe(), "-r", str(entry), target_path]
+        if entry.is_dir():
+            # MERGE the source dir's contents into the (possibly pre-existing)
+            # remote dir of the same name. The trailing "/." idiom tells scp
+            # "copy the contents, not the dir itself", which prevents the
+            # nesting bug where `scp -r ./run remote:run` lands files at
+            # `remote:run/run/...` when `remote:run` already exists.
+            # Pre-create the remote dir so scp has somewhere to merge INTO.
+            mkdir_result = _ssh_run(
+                f'cmd /c "if not exist \\"{_strix_workdir()}\\{entry.name}\\" mkdir \\"{_strix_workdir()}\\{entry.name}\\""',
+                timeout=15,
+            )
+            # Best-effort mkdir; don't abort on failure (might already exist).
+            target_path = f"{dst}{entry.name}/"
+            src = str(entry) + ("/." if os.name != "nt" else "\\.")
+            cmd = [_scp_exe(), "-r", src, target_path]
+        else:
+            target_path = f"{dst}{entry.name}"
+            cmd = [_scp_exe(), "-r", str(entry), target_path]
         print(f"  scp {entry} -> {target_path}")
         result = subprocess.run(cmd)
         if result.returncode != 0:

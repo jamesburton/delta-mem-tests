@@ -11,7 +11,7 @@ lives in [`LONG_CONTEXT_PLAN.md`](../LONG_CONTEXT_PLAN.md) (Option 1).
 
 - Strix runs Windows 11 with ROCm-on-Windows installed natively.
 - `ssh strix` lands on `cmd.exe`. PowerShell is reached via
-  `powershell.exe -NoProfile -File ...` from cmd.
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` from cmd.
 - Repo lives at `C:\Users\james\delta-mem-tests` (default -- adjust if
   cloned elsewhere).
 
@@ -49,7 +49,7 @@ does this for you over SSH.)
 
 ```powershell
 # Option A: drive everything with one command
-powershell.exe -NoProfile -File strix\run_phase1.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File strix\run_phase1.ps1
 
 # Option B: run each gate by hand (for debugging)
 python -m run.training_smoke --probe              # gate 1 -- pipeline smoke
@@ -121,7 +121,7 @@ checkpoint directory.
 ## Sanity test for the runner wiring (no GPU needed)
 
 ```powershell
-powershell.exe -NoProfile -File strix\test_runner_paths.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File strix\test_runner_paths.ps1
 ```
 
 Asserts the venv exists and `python -m run.training_smoke --help`
