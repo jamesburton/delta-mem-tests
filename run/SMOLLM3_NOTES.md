@@ -59,19 +59,18 @@ agent (or future-me) doesn't re-derive surprises.
 
 ## Open questions
 
-- **OSCAR port assumes Qwen3 attention.**
-  `third_party/oscar-transformers/oscar_transformers/rotation.py`'s
-  `_build_patched_forward` calls `self.q_norm(...)` / `self.k_norm(...)`
-  and unconditionally applies RoPE. On SmolLM3 the first forward will
-  raise `AttributeError: 'SmolLM3Attention' object has no attribute
-  'q_norm'`. **Prerequisite for Phase C of
-  `oscar_calibrate_smollm3.py` and for any inference with
-  `KV_CACHE_BACKEND=oscar` on SmolLM3.** Resolution: add a
-  SmolLM3-shaped patched_forward (no q_norm/k_norm, honour
-  `self.use_rope`) and dispatch on class in `apply_rotations` /
-  `_PATCHED_CLASSES`. Estimate: ~50 LOC in `rotation.py` mirroring the
-  existing Qwen3 path. The Phase C smoke catches the AttributeError and
-  prints a clear diagnostic so the failure mode is unambiguous.
+- ~~**OSCAR port assumes Qwen3 attention.**~~ **RESOLVED** —
+  `third_party/oscar-transformers` commit
+  `3ce9b6206310ceee1b4b52cbcdbf362eb07c7ce0` (branch
+  `smollm3-rotation-support`) refactors `_build_patched_forward` into
+  two factory functions (`_build_qwen3_patched_forward`,
+  `_build_smollm3_patched_forward`) dispatched on attention class name
+  by `_build_patched_forward_for`. The SmolLM3 variant skips q_norm/k_norm
+  and honours per-layer `self.use_rope`. Verified by
+  `tests/test_rotation_smollm3.py` (both use_rope=True and use_rope=False
+  parametrize) plus a 4-layer end-to-end SmolLM3ForCausalLM forward that
+  round-trips to max logit error 4e-7 with orthogonal rotations. Qwen3
+  path is bit-identical; all 4 pre-existing rotation tests still pass.
 
 - **`freeze_non_delta_mem_params` parameter-naming.** Verified empirically
   by the smoke — returns the expected 216 tensors with names like
